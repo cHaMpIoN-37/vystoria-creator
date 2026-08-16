@@ -1,4 +1,28 @@
 // Vystoria Creator App
+//
+// CHANGELOG (fixes for: "worked on my laptop/phone, mentor's device got a
+// FATAL ERROR about a deprecated Gemini model and got stuck"):
+//
+// 1. Model Name is now OPTIONAL and free-text for any provider. The old
+//    code hardcoded a default model per provider (e.g. 'gemini-2.5-flash')
+//    directly in this file. Providers deprecate model IDs on their own
+//    schedule and per-account — that's exactly what the mentor hit. Now,
+//    leaving the field blank tells the backend to pick its own current
+//    recommended default (see DEFAULT_MODELS in the backend), so that
+//    decision lives in ONE place that can be updated without a frontend
+//    redeploy. Paste any model ID from any provider and it's sent as-is.
+//
+// 2. FIXED A REAL BUG: once a generation task started, `taskId` was never
+//    cleared, so Engine Config / Novel Parameters stayed permanently
+//    LOCKED even after a run FAILED — there was no way back in to fix a
+//    bad API key or model name short of a full reset that was itself only
+//    reachable after a successful publish. `generationStarted` now only
+//    reflects an active/completed run, so a failed run automatically
+//    unlocks configuration for a retry.
+//
+// 3. The Generation Console and Home screen now show a clear, actionable
+//    message when a run fails, with a direct link back into Engine Config.
+
 import React, { useState, useEffect, useRef } from 'react';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm';
 import vystoriaLogo from './assets/logo.svg';
@@ -24,23 +48,42 @@ const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
 // request; cap it here too so a huge file doesn't silently balloon the payload.
 const MAX_REFERENCE_CHARS = 20000;
 
-const VystoriaMark = () => (
-  <svg viewBox="0 0 100 100" className="w-full h-full" xmlns="http://www.w3.org/2000/svg">
-    <defs>
-      <linearGradient id="vgA" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stopColor="#C4B5FD" />
-        <stop offset="100%" stopColor="#7C3AED" />
-      </linearGradient>
-      <linearGradient id="vgB" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stopColor="#8B5CF6" />
-        <stop offset="100%" stopColor="#4C1D95" />
-      </linearGradient>
-    </defs>
-    <path d="M10 15 L35 15 L50 62 L65 15 L90 15 L58 88 L42 88 Z" fill="url(#vgA)" />
-    <path d="M65 15 L90 15 L58 88 L50 70 Z" fill="url(#vgB)" opacity="0.85" />
-    <path d="M78 15 L94 15 L64 88 L58 88 Z" fill="#ffffff" opacity="0.15" />
-  </svg>
-);
+// Friendly labels + placeholder hints per provider for the Model Name field.
+// These are purely cosmetic — the actual "what model to use if the field is
+// left blank" decision is made by the backend (DEFAULT_MODELS), so that
+// logic can be kept current in one place without redeploying this app.
+const PROVIDER_LABELS = {
+  gemini: 'Google Gemini',
+  openai: 'OpenAI',
+  claude: 'Anthropic Claude',
+  grok: 'xAI Grok',
+};
+
+const MODEL_PLACEHOLDERS = {
+  gemini: 'Leave blank for the recommended default, or paste e.g. gemini-2.5-flash',
+  openai: 'Leave blank for the recommended default, or paste e.g. gpt-4o',
+  claude: 'Leave blank for the recommended default, or paste e.g. claude-sonnet-4-6',
+  grok: 'Leave blank for the recommended default, or paste e.g. grok-2-latest',
+};
+
+// Helper: pull a portrait URL out of a character's asset entry for a given
+// expression, falling back to neutral, then to any available variant. Used
+// by the PlayTestEngine to render the right face for each line.
+// entry shape:
+//   { neutral: { previewUrl, uploadedUrl }, angry: { previewUrl, uploadedUrl }, ... }
+const pickPortraitFromEntry = (charEntry, expression) => {
+  if (!charEntry) return null;
+  const preferred = charEntry[expression] || charEntry.neutral;
+  if (preferred?.previewUrl || preferred?.uploadedUrl) {
+    return preferred.previewUrl || preferred.uploadedUrl;
+  }
+  // Last resort: return the first variant that has any image at all.
+  for (const key of Object.keys(charEntry)) {
+    const v = charEntry[key];
+    if (v?.previewUrl || v?.uploadedUrl) return v.previewUrl || v.uploadedUrl;
+  }
+  return null;
+};
 
 export default function CreatorApp() {
   // Navigation
@@ -49,7 +92,16 @@ export default function CreatorApp() {
   // Config States
   const [provider, setProvider] = useState('gemini');
   const [apiKey, setApiKey] = useState('');
-  const [modelName, setModelName] = useState('gemini-2.5-flash');
+  // Model IDs get deprecated by providers on their own schedule, and can
+  // differ per-account (this is exactly what broke generation on a
+  // mentor's device while working fine elsewhere with the same key —
+  // different accounts had access to different model generations).
+  // Defaulting this to '' means the backend decides the current
+  // recommended model for the chosen provider; that logic lives in ONE
+  // place (the backend) so it can be kept current without a new frontend
+  // deploy. The creator can still paste any model ID they want — Gemini,
+  // OpenAI, Claude, Grok, anything the key has access to.
+  const [modelName, setModelName] = useState('');
 
   // Story Parameter States
   const [title, setTitle] = useState('');
@@ -60,7 +112,7 @@ export default function CreatorApp() {
   const [idea, setIdea] = useState('');
   const [runEvaluation, setRunEvaluation] = useState(true);
 
-  // NEW: reference document (draft / outline / lore) the creator can attach
+  // Reference document (draft / outline / lore) the creator can attach
   // instead of, or alongside, the free-text idea.
   const [referenceText, setReferenceText] = useState('');
   const [referenceFileName, setReferenceFileName] = useState('');
@@ -75,10 +127,21 @@ export default function CreatorApp() {
   const [logs, setLogs] = useState([]);
 
   // Asset and Story Data States
+  //
+  // NEW shape for assetFiles.characters — nested by expression:
+  //   assetFiles.characters = {
+  //     "Amara": {
+  //        neutral: { file, previewUrl, uploadedUrl },
+  //        worried: { file, previewUrl, uploadedUrl },
+  //        ...
+  //     },
+  //     "Bayo": { neutral: {...}, angry: {...} }
+  //   }
+  // Backgrounds and cover stay flat as before.
   const [assetFiles, setAssetFiles] = useState({ characters: {}, backgrounds: {}, cover: {} });
   const [showTestBed, setShowTestBed] = useState(false);
   const [hasTested, setHasTested] = useState(false);
-  // NEW: only true once the creator has actually reached an ending in the
+  // Only true once the creator has actually reached an ending in the
   // play-tester — this is what "tested end to end" means, not just opening it.
   const [hasCompletedPlaythrough, setHasCompletedPlaythrough] = useState(false);
   const [isSavingDraft, setIsSavingDraft] = useState(false);
@@ -90,7 +153,7 @@ export default function CreatorApp() {
   const [publishedStoryId, setPublishedStoryId] = useState(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
 
-  // NEW: Story Library state — lets a creator browse and resume past
+  // Story Library state — lets a creator browse and resume past
   // generation_tasks rows instead of losing everything on refresh.
   const [myStories, setMyStories] = useState([]);
   const [isLoadingLibrary, setIsLoadingLibrary] = useState(false);
@@ -130,11 +193,21 @@ export default function CreatorApp() {
   }, [taskId, taskStatus]);
 
   // --- Workflow locking -----------------------------------------------
-  // Once a generation task has been kicked off, Engine Config and Novel
-  // Parameters lock: changing the provider/API key or the story brief
-  // mid-run (or after a completed run) would desync what's on screen from
-  // what actually produced the story sitting in `resultJson`.
-  const generationStarted = taskId !== null || ['pending', 'generating', 'completed'].includes(taskStatus);
+  // Once a generation task is actively running or has finished
+  // successfully, Engine Config and Novel Parameters lock: changing the
+  // provider/API key or the story brief mid-run (or after a completed
+  // run) would desync what's on screen from what actually produced the
+  // story sitting in `resultJson`.
+  //
+  // A FAILED run deliberately does NOT lock these. If generation blew up
+  // (e.g. the provider rejected a deprecated model name, or the API key
+  // was wrong), the creator needs a way back into Engine Config to fix
+  // the provider / API key / model and press Initialize Pipeline again.
+  // Previously `taskId !== null` was part of this check, which meant a
+  // failed run left the creator permanently locked out with no path
+  // forward except a full reset that was itself only reachable after a
+  // *successful* publish — a dead end.
+  const generationStarted = ['pending', 'generating', 'completed'].includes(taskStatus);
   const configLocked = generationStarted;
 
   const resetAll = () => {
@@ -164,43 +237,58 @@ export default function CreatorApp() {
 
     try {
       const slug = `${title}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      // NEW: characters is nested by expression too. Shape:
+      //   assets.characters = { "Amara": { neutral: url, angry: url }, ... }
       const assets = { backgrounds: {}, characters: {} };
 
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) throw new Error('No active session.');
 
       // Upload backgrounds — reuse an already-uploaded draft URL if we have
-      // one (assets uploaded earlier via handleAssetFileChange, or restored
-      // by resumeTask), otherwise upload fresh.
+      // one, otherwise upload fresh.
       for (const [bgId, entry] of Object.entries(assetFiles.backgrounds)) {
         let url = entry.uploadedUrl;
-        if (!url) {
+        if (!url && entry.file) {
           const ext = entry.file.name.split('.').pop();
           const path = `assets/${slug}/backgrounds/${bgId}.${ext}`;
           const { error } = await supabase.storage.from('visual-novels').upload(path, entry.file, { upsert: true });
           if (error) throw new Error(`Background upload failed (${bgId}): ${error.message}`);
           url = supabase.storage.from('visual-novels').getPublicUrl(path).data.publicUrl;
         }
-        assets.backgrounds[bgId] = url;
+        if (url) assets.backgrounds[bgId] = url;
       }
 
-      // Upload characters — same reuse-if-already-uploaded logic as backgrounds.
-      for (const [charName, entry] of Object.entries(assetFiles.characters)) {
-        let url = entry.uploadedUrl;
-        if (!url) {
-          const ext = entry.file.name.split('.').pop();
-          const safeName = charName.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-          const path = `assets/${slug}/characters/${safeName}.${ext}`;
-          const { error } = await supabase.storage.from('visual-novels').upload(path, entry.file, { upsert: true });
-          if (error) throw new Error(`Character upload failed (${charName}): ${error.message}`);
-          url = supabase.storage.from('visual-novels').getPublicUrl(path).data.publicUrl;
+      // Upload characters — iterate the nested {charName: {expr: entry}} shape.
+      // Each expression variant becomes its own file, and the finished map
+      // stored on the story row looks like:
+      //   { "Amara": { "neutral": "https://...", "worried": "https://..." } }
+      for (const [charName, expressionMap] of Object.entries(assetFiles.characters)) {
+        if (!expressionMap || typeof expressionMap !== 'object') continue;
+        assets.characters[charName] = {};
+        for (const [expr, entry] of Object.entries(expressionMap)) {
+          if (!entry) continue;
+          let url = entry.uploadedUrl;
+          if (!url && entry.file) {
+            const ext = entry.file.name.split('.').pop();
+            const safeName = charName.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+            const safeExpr = expr.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+            const path = `assets/${slug}/characters/${safeName}_${safeExpr}.${ext}`;
+            const { error } = await supabase.storage.from('visual-novels').upload(path, entry.file, { upsert: true });
+            if (error) throw new Error(`Character upload failed (${charName}/${expr}): ${error.message}`);
+            url = supabase.storage.from('visual-novels').getPublicUrl(path).data.publicUrl;
+          }
+          if (url) assets.characters[charName][expr] = url;
         }
-        assets.characters[charName] = url;
+        // If the creator uploaded nothing at all for this character, drop the
+        // empty object so the player app's fallback logic doesn't trip on it.
+        if (Object.keys(assets.characters[charName]).length === 0) {
+          delete assets.characters[charName];
+        }
       }
 
       // Upload cover — same reuse-if-already-uploaded logic.
       let coverUrl = assetFiles.cover.cover?.uploadedUrl || null;
-      if (!coverUrl && assetFiles.cover.cover) {
+      if (!coverUrl && assetFiles.cover.cover?.file) {
         const ext = assetFiles.cover.cover.file.name.split('.').pop();
         const path = `assets/${slug}/cover.${ext}`;
         const { error } = await supabase.storage.from('visual-novels').upload(path, assetFiles.cover.cover.file, { upsert: true });
@@ -256,7 +344,7 @@ export default function CreatorApp() {
       const response = await fetch(`${BACKEND_URL}/evaluate/${taskId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider, api_key: apiKey, model_name: modelName })
+        body: JSON.stringify({ provider, api_key: apiKey, model_name: modelName.trim() })
       });
       if (!response.ok) {
         let detail = `HTTP ${response.status} ${response.statusText}`;
@@ -276,7 +364,7 @@ export default function CreatorApp() {
     }
   };
 
-  // NEW: hot-swap a single revised scene into resultJson after a tweak.
+  // Hot-swap a single revised scene into resultJson after a tweak.
   const handleSceneUpdate = (updatedScene) => {
     setResultJson(prev => {
       if (!prev) return prev;
@@ -288,9 +376,8 @@ export default function CreatorApp() {
     setLogs(prev => [...prev, `🪄 Scene "${updatedScene.id}" was rewritten per your instruction.`]);
   };
 
-  // NEW (moved here from PlayTestEngine — it needs CreatorApp's own state
-  // setters, which PlayTestEngine doesn't have in scope). Persists that the
-  // creator reached a real ending, so Publish stays unlocked across a refresh.
+  // Persists that the creator reached a real ending, so Publish stays
+  // unlocked across a refresh.
   const handleCompletePlaythrough = async () => {
     setHasCompletedPlaythrough(true);
     if (taskId) {
@@ -302,8 +389,8 @@ export default function CreatorApp() {
     }
   };
 
-  // NEW (moved here from PlayTestEngine): loads every generation_tasks row
-  // belonging to the signed-in creator, newest first, for the Story Library screen.
+  // Loads every generation_tasks row belonging to the signed-in creator,
+  // newest first, for the Story Library screen.
   const fetchMyStories = async () => {
     setIsLoadingLibrary(true);
     try {
@@ -324,10 +411,9 @@ export default function CreatorApp() {
     }
   };
 
-  // NEW (moved here from PlayTestEngine): fully rehydrates CreatorApp's
-  // state from a past generation_tasks row so the creator can pick up
-  // exactly where they left off — including previously-uploaded assets and
-  // playtest/publish status.
+  // Fully rehydrates CreatorApp's state from a past generation_tasks row so
+  // the creator can pick up exactly where they left off — including
+  // previously-uploaded assets and playtest/publish status.
   const resumeTask = async (task) => {
     const { data, error } = await supabase.from('generation_tasks').select('*').eq('id', task.id).single();
     if (error) { alert(`Could not resume: ${error.message}`); return; }
@@ -351,13 +437,38 @@ export default function CreatorApp() {
     setSubtitle(rest.join(':').trim());
 
     const draft = data.draft_assets || {};
-    const toEntries = (obj) => Object.fromEntries(
+
+    // Flat rehydrate (backgrounds, cover): {key: url} → {key: {previewUrl, uploadedUrl}}
+    const flatEntries = (obj) => Object.fromEntries(
       Object.entries(obj || {}).map(([k, url]) => [k, { file: null, previewUrl: url, uploadedUrl: url }])
     );
+
+    // Nested rehydrate for characters. The draft_assets row supports BOTH shapes:
+    //   Old:  { "Amara": "https://..." }                         (single portrait per character)
+    //   New:  { "Amara": { "neutral": "...", "angry": "..." } }  (per-expression)
+    // We normalize old-shape drafts into the new shape by treating the single
+    // URL as the "neutral" variant, so nothing gets lost on resume.
+    const nestedCharEntries = (obj) => {
+      const out = {};
+      for (const [name, val] of Object.entries(obj || {})) {
+        if (typeof val === 'string') {
+          out[name] = { neutral: { file: null, previewUrl: val, uploadedUrl: val } };
+        } else if (val && typeof val === 'object') {
+          out[name] = {};
+          for (const [expr, url] of Object.entries(val)) {
+            if (typeof url === 'string') {
+              out[name][expr] = { file: null, previewUrl: url, uploadedUrl: url };
+            }
+          }
+        }
+      }
+      return out;
+    };
+
     setAssetFiles({
-      characters: toEntries(draft.characters),
-      backgrounds: toEntries(draft.backgrounds),
-      cover: toEntries(draft.cover),
+      characters: nestedCharEntries(draft.characters),
+      backgrounds: flatEntries(draft.backgrounds),
+      cover: flatEntries(draft.cover),
     });
 
     setCurrentView(['pending', 'generating'].includes(data.status) ? 'console' : 'home');
@@ -385,11 +496,26 @@ export default function CreatorApp() {
       return;
     }
 
+    // Clear out anything left over from a previous (possibly failed)
+    // attempt so the UI can never show a stale scene, scorecard, asset
+    // manifest, or task id from a run that no longer represents what's on
+    // screen. Clearing taskId in particular stops the background poller
+    // from briefly re-attaching to the OLD (failed) task row while this
+    // new request is in flight.
+    setTaskId(null);
     setIsSubmitting(true);
     setTaskStatus('pending');
     setLogs(['[System] Sending configuration to the Vystoria Engine...']);
     setProgress(0);
+    setCurrentStep('');
     setEvaluationScorecard(null);
+    setResultJson(null);
+    setAssetManifest(null);
+    setWorldBible(null);
+    setPublishedStoryId(null);
+    setDraftSaved(false);
+    setHasCompletedPlaythrough(false);
+    setHasTested(false);
 
     try {
       let userId;
@@ -414,7 +540,7 @@ export default function CreatorApp() {
         body: JSON.stringify({
           provider,
           api_key: apiKey,
-          model_name: modelName,
+          model_name: modelName.trim(),
           title,
           subtitle,
           genre,
@@ -455,46 +581,97 @@ export default function CreatorApp() {
   const handleProviderChange = (e) => {
     const newProvider = e.target.value;
     setProvider(newProvider);
-    if (newProvider === 'gemini') setModelName('gemini-2.5-flash');
-    if (newProvider === 'openai') setModelName('gpt-4o');
-    if (newProvider === 'claude') setModelName('claude-3-5-sonnet-20240620');
-    if (newProvider === 'grok') setModelName('grok-2-beta');
+    // A model name that was valid for the old provider almost certainly
+    // isn't valid for the new one — clear it instead of guessing a
+    // hardcoded default here. Leaving it blank lets the backend apply its
+    // own (centrally-updatable) recommended default for whichever
+    // provider ends up selected.
+    setModelName('');
   };
 
-  // NEW: uploads art the moment it's picked (instead of waiting for
-  // Publish), and records the resulting public URL onto the task row's
-  // draft_assets column so a refresh mid-upload doesn't lose it.
-  const handleAssetFileChange = async (kind, key, file) => {
+  // Uploads art the moment it's picked (instead of waiting for Publish), and
+  // records the resulting public URL onto the task row's draft_assets column
+  // so a refresh mid-upload doesn't lose it.
+  //
+  // For characters, `expression` is required and the state / storage are
+  // nested by (character name, expression). For backgrounds and cover,
+  // expression stays null and the state is flat.
+  const handleAssetFileChange = async (kind, key, file, expression = null) => {
     if (!file || !taskId) return;
+
     const previewUrl = URL.createObjectURL(file);
-    setAssetFiles(prev => ({ ...prev, [kind]: { ...prev[kind], [key]: { file, previewUrl, uploading: true } } }));
+    const isCharWithExpr = kind === 'characters' && !!expression;
+
+    // Optimistic local update, respecting nesting for characters.
+    setAssetFiles(prev => {
+      if (!isCharWithExpr) {
+        return { ...prev, [kind]: { ...prev[kind], [key]: { file, previewUrl, uploading: true } } };
+      }
+      const existingChar = prev.characters[key] || {};
+      return {
+        ...prev,
+        characters: {
+          ...prev.characters,
+          [key]: { ...existingChar, [expression]: { file, previewUrl, uploading: true } }
+        }
+      };
+    });
 
     try {
       const safeKey = key.toLowerCase().replace(/[^a-z0-9]+/g, '_');
       const ext = file.name.split('.').pop();
-      const path = `assets/${taskId}/${kind}/${safeKey}.${ext}`;
+      const suffix = isCharWithExpr ? `_${expression.toLowerCase().replace(/[^a-z0-9]+/g, '_')}` : '';
+      const path = `assets/${taskId}/${kind}/${safeKey}${suffix}.${ext}`;
       const { error: upErr } = await supabase.storage.from('visual-novels').upload(path, file, { upsert: true });
       if (upErr) throw upErr;
       const publicUrl = supabase.storage.from('visual-novels').getPublicUrl(path).data.publicUrl;
 
-      setAssetFiles(prev => ({ ...prev, [kind]: { ...prev[kind], [key]: { file, previewUrl, uploadedUrl: publicUrl, uploading: false } } }));
+      // Commit the uploaded URL to local state (nested for characters).
+      setAssetFiles(prev => {
+        if (!isCharWithExpr) {
+          return { ...prev, [kind]: { ...prev[kind], [key]: { file, previewUrl, uploadedUrl: publicUrl } } };
+        }
+        const existingChar = prev.characters[key] || {};
+        return {
+          ...prev,
+          characters: {
+            ...prev.characters,
+            [key]: { ...existingChar, [expression]: { file, previewUrl, uploadedUrl: publicUrl } }
+          }
+        };
+      });
 
+      // Persist to draft_assets on the task row (nested for characters,
+      // flat for backgrounds/cover — same as the state shape).
       const { data: row } = await supabase.from('generation_tasks').select('draft_assets').eq('id', taskId).single();
       const draft = row?.draft_assets || {};
-      await supabase.from('generation_tasks').update({
-        draft_assets: { ...draft, [kind]: { ...(draft[kind] || {}), [key]: publicUrl } }
-      }).eq('id', taskId);
+      if (isCharWithExpr) {
+        draft.characters = draft.characters || {};
+        // If a prior draft accidentally stored a flat string for this char
+        // (old-shape leftovers), promote it into the new nested object under
+        // "neutral" so we don't lose that upload when we merge in the new one.
+        if (typeof draft.characters[key] === 'string') {
+          draft.characters[key] = { neutral: draft.characters[key] };
+        }
+        draft.characters[key] = { ...(draft.characters[key] || {}), [expression]: publicUrl };
+      } else {
+        draft[kind] = { ...(draft[kind] || {}), [key]: publicUrl };
+      }
+      await supabase.from('generation_tasks').update({ draft_assets: draft }).eq('id', taskId);
     } catch (err) {
       console.error('Asset upload failed:', err);
-      setLogs(prev => [...prev, `[Error] Failed to upload ${kind} "${key}": ${err.message}`]);
+      setLogs(prev => [...prev, `[Error] Failed to upload ${kind} "${key}"${isCharWithExpr ? '/' + expression : ''}: ${err.message}`]);
     }
   };
 
+  // A simple flat row used for backgrounds and cover art. Characters get
+  // their own richer component (CharacterAssetCard) below because they now
+  // have per-expression upload slots.
   const AssetRow = ({ id, description, preview, onFile }) => {
     const [showModal, setShowModal] = useState(false);
     return (
       <>
-        <div 
+        <div
           className="bg-[#1C1635] border border-transparent rounded-2xl p-4 flex items-center gap-4 hover:border-[#8B5CF6]/30 transition-all shadow-sm cursor-pointer"
           onClick={() => setShowModal(true)}
         >
@@ -505,7 +682,7 @@ export default function CreatorApp() {
             <p className="text-white text-base font-bold truncate tracking-wide">{id}</p>
             <p className="text-[#8A7DAB] text-[13px] leading-snug line-clamp-2 mt-1">{description || 'No description generated.'}</p>
           </div>
-          <label 
+          <label
             className="bg-transparent hover:bg-[#2D1B4E] border border-[#4D3A7A] hover:border-[#8B5CF6] text-white text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer flex-shrink-0 transition-colors shadow-sm flex items-center gap-2"
             onClick={e => e.stopPropagation()}
           >
@@ -535,7 +712,61 @@ export default function CreatorApp() {
       </>
     );
   };
-  
+
+  // Per-character asset card: one row per character, with a grid of upload
+  // slots — one slot per expression the story actually uses for them. The
+  // character's shared base description is shown once at the top; each
+  // expression tile shows its own short "note" underneath its filename tag.
+  const CharacterAssetCard = ({ character, uploadedByExpr, onUpload }) => {
+    const expressions = character.expressions?.length
+      ? character.expressions
+      : [{ id: 'neutral', note: '' }];
+
+    return (
+      <div className="bg-[#1C1635] border border-[#2D1B4E] rounded-2xl p-4">
+        <div className="mb-4">
+          <p className="text-white font-bold text-base tracking-wide">{character.name}</p>
+          <p className="text-[#8A7DAB] text-[13px] leading-snug mt-1">
+            {character.base_description || character.description || 'No description generated.'}
+          </p>
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          {expressions.map(expr => {
+            const entry = uploadedByExpr?.[expr.id];
+            const preview = entry?.previewUrl || entry?.uploadedUrl;
+            return (
+              <label
+                key={expr.id}
+                className="relative aspect-square bg-[#0B0B14] border border-[#2D1B4E] rounded-lg overflow-hidden cursor-pointer hover:border-[#8B5CF6]/60 transition-colors group"
+                title={expr.note || expr.id}
+              >
+                {preview ? (
+                  <img src={preview} alt={`${character.name} - ${expr.id}`} className="w-full h-full object-cover" />
+                ) : (
+                  <div className="w-full h-full flex flex-col items-center justify-center gap-1 px-2 text-center">
+                    <ImageIcon className="w-4 h-4 text-[#4D3A7A] group-hover:text-[#8B5CF6] transition-colors" />
+                    {expr.note && (
+                      <span className="text-[9px] text-[#4D3A7A] leading-tight line-clamp-2">{expr.note}</span>
+                    )}
+                  </div>
+                )}
+                <div className="absolute bottom-0 inset-x-0 bg-black/75 backdrop-blur-sm text-white text-[9px] py-1 text-center font-bold tracking-widest uppercase">
+                  {expr.id}
+                </div>
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => onUpload(expr.id, e.target.files?.[0])}
+                />
+              </label>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   const UploadCloudIcon = ({className}) => (
      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={className}>
         <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"></path>
@@ -574,8 +805,8 @@ export default function CreatorApp() {
       onClick={onClick}
       disabled={disabled}
       className={`w-full flex items-center justify-between rounded-3xl p-5 transition-all duration-300 border ${
-        disabled 
-            ? 'bg-[#120F24] border-transparent opacity-60 cursor-not-allowed' 
+        disabled
+            ? 'bg-[#120F24] border-transparent opacity-60 cursor-not-allowed'
             : 'bg-[#1C1635] border-[#2D1B4E] hover:border-[#8B5CF6]/50 hover:bg-[#211B3D] active:scale-[0.98]'
       }`}
     >
@@ -588,7 +819,7 @@ export default function CreatorApp() {
             <span className="text-[#8A7DAB] text-[13px] font-medium mt-0.5 text-left">{description}</span>
         </div>
       </div>
-      
+
       {disabled ? (
         <span className="text-[10px] text-[#4D3A7A] font-bold uppercase tracking-widest mr-2">{disabledLabel}</span>
       ) : trailing}
@@ -598,7 +829,7 @@ export default function CreatorApp() {
   const FieldLabel = ({ children }) => (
     <label className="text-[13px] font-bold text-[#A78BFA] uppercase tracking-widest mb-2.5 block">{children}</label>
   );
-  
+
   const fieldClasses = "w-full bg-[#1C1635] border border-[#2D1B4E] rounded-2xl p-4 text-[15px] text-white focus:outline-none focus:border-[#8B5CF6] focus:ring-1 focus:ring-[#8B5CF6] transition-all placeholder:text-[#4D3A7A]";
 
   // --- Screens ---
@@ -612,24 +843,30 @@ export default function CreatorApp() {
         <h1 className="text-4xl font-bold font-sans tracking-wide text-white mb-1">Vystoria</h1>
         <p className="text-lg text-purple-300 font-sans tracking-wide mb-4">Story Engine</p>
 
-        <div className="flex items-center gap-2.5 bg-[#120F24] border border-[#2D1B4E] rounded-full px-4 py-2 mb-10 shadow-inner">
+        <div className="flex items-center gap-2.5 bg-[#120F24] border border-[#2D1B4E] rounded-full px-4 py-2 mb-4 shadow-inner">
           <span className={`w-2.5 h-2.5 rounded-full ${status.dot}`}></span>
           <span className={`text-xs font-bold uppercase tracking-wider ${status.text}`}>{status.label}</span>
         </div>
 
+        {taskStatus === 'failed' && (
+          <p className="text-[#FCA5A5] text-[12px] font-semibold text-center max-w-xs leading-relaxed mb-6 px-2">
+            Last attempt failed — see the Generation Console for details. Engine Config is unlocked, so fix it and hit Initialize Pipeline again.
+          </p>
+        )}
+
         <div className="w-full space-y-4 max-w-md mx-auto">
-          <NavPill 
-            icon={Cpu} 
-            label="Engine Config" 
-            description={`${provider} · ${modelName.split('-')[0]}`} 
+          <NavPill
+            icon={Cpu}
+            label="Engine Config"
+            description={`${provider}${modelName.trim() ? ' · ' + modelName.trim().split('-')[0] : ' · auto-selected model'}`}
             onClick={() => setCurrentView('engine_config')}
             disabled={configLocked}
             disabledLabel="Locked after start"
           />
-          <NavPill 
-            icon={BookOpen} 
-            label="Novel Parameters" 
-            description={title ? `${title}` : 'Untitled draft'} 
+          <NavPill
+            icon={BookOpen}
+            label="Novel Parameters"
+            description={title ? `${title}` : 'Untitled draft'}
             onClick={() => setCurrentView('novel_parameters')}
             disabled={configLocked}
             disabledLabel="Locked after start"
@@ -641,19 +878,19 @@ export default function CreatorApp() {
             onClick={() => setCurrentView('console')}
             trailing={<span className={`w-3 h-3 rounded-full ${status.dot} mr-2`} />}
           />
-          <NavPill 
-            icon={Scale} 
-            label="AI Judgement" 
-            description="Quality scorecard" 
-            onClick={() => setCurrentView('judgement')} 
-            disabled={!resultJson} 
+          <NavPill
+            icon={Scale}
+            label="AI Judgement"
+            description="Quality scorecard"
+            onClick={() => setCurrentView('judgement')}
+            disabled={!resultJson}
           />
-          <NavPill 
-            icon={ImageIcon} 
-            label="Story Assets" 
-            description="Art, play-test & save" 
-            onClick={() => setCurrentView('assets')} 
-            disabled={!resultJson} 
+          <NavPill
+            icon={ImageIcon}
+            label="Story Assets"
+            description="Art, play-test & save"
+            onClick={() => setCurrentView('assets')}
+            disabled={!resultJson}
           />
           <NavPill
             icon={FileText}
@@ -674,17 +911,14 @@ export default function CreatorApp() {
           {['pending', 'generating'].includes(taskStatus) ? 'Engine Running...' : generationStarted ? 'Pipeline Already Run' : 'Initialize Pipeline'}
         </button>
 
-        {/* Start Over is hidden until the creator has actually finished a
-            full play-through AND saved the draft — this is the "only then
-            move to start from top" rule from the workflow spec. */}
-        {hasCompletedPlaythrough && draftSaved && (
+        {(hasCompletedPlaythrough && draftSaved) || taskStatus === 'failed' ? (
           <button
             onClick={resetAll}
             className="w-full mt-3 bg-transparent border border-[#3B0764] hover:bg-[#1C1635] text-[#A78BFA] font-bold py-4 rounded-full text-[15px] transition-all flex items-center justify-center gap-2"
           >
-            <RotateCcw className="w-4 h-4" /> Start New Story
+            <RotateCcw className="w-4 h-4" /> {taskStatus === 'failed' ? 'Start Completely Fresh' : 'Start New Story'}
           </button>
-        )}
+        ) : null}
       </div>
     </div>
   );
@@ -692,7 +926,7 @@ export default function CreatorApp() {
   const renderEngineConfig = () => (
     <div className="flex flex-col h-full bg-[#0B0B14]">
       <div className="flex-1 overflow-y-auto px-6 pt-12 pb-6 max-w-md mx-auto w-full">
-        <ScreenHeader title="Engine Config" subtitleText="Configure your LLM provider." />
+        <ScreenHeader title="Engine Config" subtitleText="Paste any provider's API key — the engine works with whatever model that key currently has access to." />
         <div className="space-y-6 mt-8">
           <div>
             <FieldLabel>Provider</FieldLabel>
@@ -704,8 +938,22 @@ export default function CreatorApp() {
             </select>
           </div>
           <div>
-            <FieldLabel>Model Name</FieldLabel>
-            <input type="text" value={modelName} onChange={(e) => setModelName(e.target.value)} className={fieldClasses} />
+            <FieldLabel>
+              Model Name <span className="text-[#8A7DAB] normal-case tracking-normal text-xs ml-1">(optional)</span>
+            </FieldLabel>
+            <input
+              type="text"
+              value={modelName}
+              onChange={(e) => setModelName(e.target.value)}
+              placeholder={MODEL_PLACEHOLDERS[provider] || 'Leave blank for the recommended default'}
+              className={fieldClasses}
+            />
+            <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">
+              Leave this blank and the engine will use its current recommended model for {PROVIDER_LABELS[provider] || 'this provider'}.
+              Or paste any model ID your key has access to — old or new, it doesn't matter which provider. If a run ever fails because a
+              model was retired or renamed, come back here, clear or change this field, and hit Initialize Pipeline again — nothing else
+              needs to change.
+            </p>
           </div>
           <div>
             <FieldLabel><span className="flex items-center gap-2"><Key className="w-4 h-4" /> Secret API Key</span></FieldLabel>
@@ -763,7 +1011,6 @@ export default function CreatorApp() {
             />
           </div>
 
-          {/* NEW: reference document upload */}
           <div>
             <FieldLabel>
               Reference Story Doc <span className="text-[#8A7DAB] normal-case tracking-normal text-xs ml-1">(optional — .txt or .md)</span>
@@ -855,6 +1102,25 @@ export default function CreatorApp() {
         </div>
       )}
 
+      {taskStatus === 'failed' && (
+        <div className="mx-6 mb-6 bg-[#3B0764]/20 border border-[#EF4444]/50 rounded-2xl p-5 flex-shrink-0 max-w-md w-[calc(100%-48px)] sm:mx-auto flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 text-[#FCA5A5] flex-shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <p className="text-[#FCA5A5] font-bold text-[14px] mb-1 leading-snug">{currentStep || 'Generation failed'}</p>
+            <p className="text-[#C4B5FD] text-[12px] leading-relaxed mb-3">
+              Engine Config and Novel Parameters are unlocked. Adjust the provider, API key, or model name, then come back and hit
+              Initialize Pipeline again.
+            </p>
+            <button
+              onClick={() => setCurrentView('engine_config')}
+              className="bg-[#2D1B4E] hover:bg-[#3B0764] text-white text-[12px] font-bold px-4 py-2.5 rounded-xl transition-colors"
+            >
+              Open Engine Config
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="flex-1 overflow-y-auto px-6 pb-8 font-mono text-[13px] leading-relaxed space-y-3 max-w-md mx-auto w-full">
         {logs.length === 0 ? (
           <div className="text-[#4D3A7A] h-full flex flex-col items-center justify-center italic text-center gap-4 px-4 pb-20">
@@ -865,8 +1131,6 @@ export default function CreatorApp() {
           logs.map((log, i) => {
             const isError = log.includes('[Error]');
             const isSuccess = log.includes('✅') || log.includes('Success');
-            const logContent = log.replace(/^\[.*?\]\s*/, '');
-            
             return (
               <div key={i} className="flex gap-4 bg-[#120F24] border border-[#1C1635] rounded-xl px-4 py-3.5 shadow-sm">
                 <span className="text-[#A78BFA] select-none font-bold">[{String(i + 1).padStart(3, '0')}]</span>
@@ -882,8 +1146,6 @@ export default function CreatorApp() {
     </div>
   );
 
-  // NEW: Story Library screen — lists every generation_tasks row for the
-  // signed-in creator and lets them jump back into one via resumeTask().
   const renderLibrary = () => (
     <div className="flex flex-col h-full bg-[#0B0B14]">
       <div className="flex-1 overflow-y-auto px-6 pt-12 pb-6 max-w-md mx-auto w-full">
@@ -954,22 +1216,33 @@ export default function CreatorApp() {
 
             <div>
               <div className="inline-flex items-center gap-2 bg-[#1C1635] px-4 py-2 rounded-full mb-4">
-                <h4 className="text-[#A78BFA] font-bold text-xs tracking-widest uppercase">Characters ({assetManifest?.characters?.length || 0})</h4>
+                <h4 className="text-[#A78BFA] font-bold text-xs tracking-widest uppercase">
+                  Characters ({assetManifest?.characters?.length || 0})
+                </h4>
               </div>
+              <p className="text-[11px] text-[#4D3A7A] italic mb-3 pl-1 leading-relaxed">
+                One row per canonical character. Upload a portrait for each expression the story uses —
+                unfilled expressions fall back to <span className="text-[#8A7DAB] not-italic font-bold">neutral</span> at play time.
+              </p>
               <div className="space-y-3">
                 {(assetManifest?.characters || []).map(c => (
-                  <AssetRow key={c.name} id={c.name} description={c.description} preview={assetFiles.characters[c.name]?.previewUrl} onFile={(f) => handleAssetFileChange('characters', c.name, f)} />
+                  <CharacterAssetCard
+                    key={c.name}
+                    character={c}
+                    uploadedByExpr={assetFiles.characters[c.name]}
+                    onUpload={(exprId, file) => handleAssetFileChange('characters', c.name, file, exprId)}
+                  />
                 ))}
               </div>
             </div>
-            
+
             <div>
               <div className="inline-flex items-center gap-2 bg-[#1C1635] px-4 py-2 rounded-full mb-4">
                 <h4 className="text-[#A78BFA] font-bold text-xs tracking-widest uppercase">Backgrounds ({assetManifest?.backgrounds?.length || 0})</h4>
               </div>
               <div className="space-y-3">
                 {(assetManifest?.backgrounds || []).map(b => (
-                  <AssetRow key={b.id} id={b.id} description={b.description} preview={assetFiles.backgrounds[b.id]?.previewUrl} onFile={(f) => handleAssetFileChange('backgrounds', b.id, f)} />
+                  <AssetRow key={b.id} id={b.id} description={b.description} preview={assetFiles.backgrounds[b.id]?.previewUrl || assetFiles.backgrounds[b.id]?.uploadedUrl} onFile={(f) => handleAssetFileChange('backgrounds', b.id, f)} />
                 ))}
               </div>
             </div>
@@ -982,7 +1255,7 @@ export default function CreatorApp() {
                 <AssetRow
                   id="Cover Image"
                   description={assetManifest?.cover?.description || "Key art for your visual novel cover."}
-                  preview={assetFiles.cover.cover?.previewUrl}
+                  preview={assetFiles.cover.cover?.previewUrl || assetFiles.cover.cover?.uploadedUrl}
                   onFile={(f) => handleAssetFileChange('cover', 'cover', f)}
                 />
               </div>
@@ -1175,7 +1448,7 @@ function PlayTestEngine({
   const [saveSlots, setSaveSlots] = useState(Array(8).fill(null));
   const [playerError, setPlayerError] = useState(null);
 
-  // NEW: scene tweak modal state
+  // Scene tweak modal state
   const [showTweakModal, setShowTweakModal] = useState(false);
   const [tweakInstruction, setTweakInstruction] = useState('');
   const [isTweaking, setIsTweaking] = useState(false);
@@ -1188,12 +1461,21 @@ function PlayTestEngine({
   const currentSequenceBlock = sequenceList[sequenceIndex] || {};
   const isEndOfSequence = sequenceIndex >= sequenceList.length - 1;
 
-  const bgUrl = assetFiles?.backgrounds?.[currentScene.background]?.previewUrl || null;
+  const bgUrl = assetFiles?.backgrounds?.[currentScene.background]?.previewUrl
+             || assetFiles?.backgrounds?.[currentScene.background]?.uploadedUrl
+             || null;
+
+  // NEW: expression-aware portrait lookup. Reads assetFiles.characters[speaker]
+  // (which is nested by expression id in the new shape) and picks the right
+  // variant with a fallback chain to neutral, then to any available portrait.
   const portraitUrl = currentSequenceBlock.speaker
-    ? assetFiles?.characters?.[currentSequenceBlock.speaker]?.previewUrl
+    ? pickPortraitFromEntry(
+        assetFiles?.characters?.[currentSequenceBlock.speaker],
+        currentSequenceBlock.expression || 'neutral'
+      )
     : null;
 
-  // NEW: load any previously-saved test slots for this task, so a refresh
+  // Load any previously-saved test slots for this task, so a refresh
   // (or simply re-opening the play-tester) doesn't wipe the creator's
   // in-progress test run.
   useEffect(() => {
@@ -1239,8 +1521,6 @@ function PlayTestEngine({
     }
   };
 
-  // NEW: actually persists the save slot to Supabase (keyed on taskId) so it
-  // survives a refresh, instead of only living in local component state.
   const handleSaveSlot = async (idx) => {
     const newSlots = [...saveSlots];
     newSlots[idx] = { sceneId: currentSceneId, date: new Date().toLocaleString() };
@@ -1281,7 +1561,7 @@ function PlayTestEngine({
         body: JSON.stringify({
           provider,
           api_key: apiKey,
-          model_name: modelName,
+          model_name: modelName.trim(),
           world_bible: worldBible || '',
           scene: currentScene,
           instruction: tweakInstruction.trim(),
@@ -1334,17 +1614,20 @@ function PlayTestEngine({
         <div className="absolute top-6 right-6 z-50 w-10 h-10 bg-[#120F24]/80 backdrop-blur-md rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2D1B4E] transition border border-[#2D1B4E]" onClick={onClose}>
           <X className="text-[#A78BFA] w-5 h-5" />
         </div>
-        
-        <div 
+
+        <div
           className="absolute top-6 left-6 z-50 bg-[#120F24]/80 backdrop-blur-md border border-[#2D1B4E] text-[#C4B5FD] text-[11px] font-mono px-4 py-2 rounded-full flex items-center gap-2 cursor-pointer hover:bg-[#2D1B4E] transition-colors"
           onClick={() => { if (playerState === 'playing') setPlayerState('paused'); }}
         >
            <Menu className="w-3.5 h-3.5 opacity-70" />
-           <span>scene: {currentScene.id || '—'} · bg: {currentScene.background || '—'}{!bgUrl && ' (no art)'}</span>
+           <span>
+             scene: {currentScene.id || '—'} · bg: {currentScene.background || '—'}{!bgUrl && ' (no art)'}
+             {currentSequenceBlock.speaker && currentSequenceBlock.expression && (
+               <> · {currentSequenceBlock.speaker}:{currentSequenceBlock.expression}{!portraitUrl && ' (no art)'}</>
+             )}
+           </span>
         </div>
 
-        {/* NEW: Tweak This Scene — only shown while actively reading, so the
-            instruction always refers to a real, currently-visible scene. */}
         {playerState === 'playing' && (
           <button
             onClick={() => { setTweakError(null); setShowTweakModal(true); }}
@@ -1447,7 +1730,7 @@ function PlayTestEngine({
                 </button>
                 <h2 className="text-[22px] font-serif font-bold text-white tracking-wide pr-12 w-full text-center">Save Game</h2>
               </div>
-              
+
               <div className="flex-1 overflow-y-auto space-y-3 pb-6 no-scrollbar">
                 {saveSlots.map((slot, idx) => (
                   <button key={idx} onClick={() => handleSaveSlot(idx)} className="w-full bg-[#120F24] hover:bg-[#1C1635] border border-[#2D1B4E] hover:border-[#8B5CF6]/50 text-white text-left px-5 py-4 rounded-2xl flex items-center justify-between transition-all group">
@@ -1493,8 +1776,7 @@ function PlayTestEngine({
           </>
         )}
 
-        {/* NEW: real ending screen, drives hasCompletedPlaythrough */}
-                {playerState === 'story_end' && (
+        {playerState === 'story_end' && (
           <>
             <Backdrop blurred />
             <div className="relative z-10 flex flex-col items-center justify-center w-full h-full px-8 pb-12 pt-8 text-center">
@@ -1532,7 +1814,7 @@ function PlayTestEngine({
             {portraitUrl && (
               <img
                 src={portraitUrl}
-                alt={currentSequenceBlock.speaker}
+                alt={`${currentSequenceBlock.speaker || 'character'} (${currentSequenceBlock.expression || 'neutral'})`}
                 className="absolute bottom-0 right-4 h-[80%] max-h-[600px] object-contain drop-shadow-2xl z-30 pointer-events-none"
               />
             )}
