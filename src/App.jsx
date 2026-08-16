@@ -4,7 +4,7 @@
 // FATAL ERROR about a deprecated Gemini model and got stuck"):
 //
 // 1. Model Name is now OPTIONAL and free-text for any provider. The old
-//    code hardcoded a default model per provider (e.g. 'gemini-2.5-flash')
+//    code hardcoded a default model per provider (e.g. 'gemini-3.5-flash')
 //    directly in this file. Providers deprecate model IDs on their own
 //    schedule and per-account — that's exactly what the mentor hit. Now,
 //    leaving the field blank tells the backend to pick its own current
@@ -60,7 +60,7 @@ const PROVIDER_LABELS = {
 };
 
 const MODEL_PLACEHOLDERS = {
-  gemini: 'Leave blank for the recommended default, or paste e.g. gemini-2.5-flash',
+  gemini: 'Leave blank for the recommended default, or paste e.g. gemini-3.5-flash',
   openai: 'Leave blank for the recommended default, or paste e.g. gpt-4o',
   claude: 'Leave blank for the recommended default, or paste e.g. claude-sonnet-4-6',
   grok: 'Leave blank for the recommended default, or paste e.g. grok-2-latest',
