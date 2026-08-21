@@ -22,6 +22,28 @@
 //
 // 3. The Generation Console and Home screen now show a clear, actionable
 //    message when a run fails, with a direct link back into Engine Config.
+//
+// 4. AI Judge is no longer an opt-out checkbox — the backend always runs
+//    it and auto-regenerates the whole draft once if it fails, so this
+//    file no longer sends/collects a `run_evaluation` flag.
+//
+// 5. Publish now requires an explicit confirmation modal (from either the
+//    Story Assets screen or the "The End" screen in the play-tester)
+//    before it actually writes to the public catalog.
+//
+// 6. Each character expression tile in Story Assets now has a copy button
+//    that copies that expression's art-prompt text to the clipboard, so
+//    creators can paste it straight into an external image generator.
+//
+// 7. FIXED THE LOOPING/STUCK-NEAR-THE-END BUG: the play-tester's
+//    `handleChoice` used to navigate to whatever `next_scene` a choice had
+//    without checking it actually existed in the story. A dangling
+//    reference (now also repaired server-side, but defended here too)
+//    silently fell through to the scene lookup's `scenes[0]` fallback —
+//    which looked exactly like the story mysteriously "looping back to
+//    the start" instead of ending. `handleChoice` now validates the
+//    target exists before navigating, and surfaces a clear dead-end error
+//    otherwise instead of silently jumping back to scene 1.
 
 import React, { useState, useEffect, useRef } from 'react';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm';
@@ -29,7 +51,8 @@ import vystoriaLogo from './assets/logo.svg';
 import {
   Cpu, BookOpen, Terminal, Scale, Image as ImageIcon, Sparkles, Loader2, Key,
   Play, CheckCircle2, AlertTriangle, RefreshCw, XCircle, MinusCircle, ChevronDown,
-  ArrowLeft, Menu, ArrowRight, Save, Download, X, Wand2, FileText, RotateCcw
+  ArrowLeft, Menu, ArrowRight, Save, Download, X, Wand2, FileText, RotateCcw,
+  Copy, Check
 } from 'lucide-react';
 
 // --- SUPABASE CONFIGURATION (Same as the player app) ---
@@ -110,7 +133,6 @@ export default function CreatorApp() {
   const [targetLength, setTargetLength] = useState('8 chapters');
   const [tone, setTone] = useState('Dark, suspenseful, mysterious');
   const [idea, setIdea] = useState('');
-  const [runEvaluation, setRunEvaluation] = useState(true);
 
   // Reference document (draft / outline / lore) the creator can attach
   // instead of, or alongside, the free-text idea.
@@ -152,6 +174,14 @@ export default function CreatorApp() {
   const [worldBible, setWorldBible] = useState(null); // needed as context for scene tweaks
   const [publishedStoryId, setPublishedStoryId] = useState(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
+
+  // Publish now goes through an explicit confirmation step instead of
+  // firing immediately when the Publish button is tapped.
+  const [showPublishConfirm, setShowPublishConfirm] = useState(false);
+
+  // Tracks which expression tile's art-prompt was just copied, so the
+  // little copy icon can flash a checkmark for a moment.
+  const [copiedExpr, setCopiedExpr] = useState(null);
 
   // Story Library state — lets a creator browse and resume past
   // generation_tasks rows instead of losing everything on refresh.
@@ -548,7 +578,6 @@ export default function CreatorApp() {
           tone,
           idea: idea.trim() || null,
           reference_text: referenceText.trim() || null,
-          run_evaluation: runEvaluation,
           user_id: userId
         })
       });
@@ -664,6 +693,24 @@ export default function CreatorApp() {
     }
   };
 
+  // Copies a ready-to-paste art prompt for one character expression to the
+  // clipboard — the character's base description plus that expression's
+  // specific note — so it can be dropped straight into an external image
+  // generator instead of retyping the description by hand.
+  const handleCopyExpressionPrompt = async (character, expr) => {
+    const promptText = [character.base_description || character.description, expr.note]
+      .filter(Boolean)
+      .join(' — ');
+    try {
+      await navigator.clipboard.writeText(promptText);
+      const key = `${character.name}__${expr.id}`;
+      setCopiedExpr(key);
+      setTimeout(() => setCopiedExpr(prev => (prev === key ? null : prev)), 1500);
+    } catch (err) {
+      console.error('Copy failed:', err);
+    }
+  };
+
   // A simple flat row used for backgrounds and cover art. Characters get
   // their own richer component (CharacterAssetCard) below because they now
   // have per-expression upload slots.
@@ -716,8 +763,10 @@ export default function CreatorApp() {
   // Per-character asset card: one row per character, with a grid of upload
   // slots — one slot per expression the story actually uses for them. The
   // character's shared base description is shown once at the top; each
-  // expression tile shows its own short "note" underneath its filename tag.
-  const CharacterAssetCard = ({ character, uploadedByExpr, onUpload }) => {
+  // expression tile shows its own short "note" underneath its filename tag,
+  // and carries a small copy button that copies a ready-to-paste art prompt
+  // (base description + expression note) to the clipboard.
+  const CharacterAssetCard = ({ character, uploadedByExpr, onUpload, onCopyPrompt, copiedKey }) => {
     const expressions = character.expressions?.length
       ? character.expressions
       : [{ id: 'neutral', note: '' }];
@@ -734,32 +783,45 @@ export default function CreatorApp() {
           {expressions.map(expr => {
             const entry = uploadedByExpr?.[expr.id];
             const preview = entry?.previewUrl || entry?.uploadedUrl;
+            const tileKey = `${character.name}__${expr.id}`;
+            const justCopied = copiedKey === tileKey;
             return (
-              <label
-                key={expr.id}
-                className="relative aspect-square bg-[#0B0B14] border border-[#2D1B4E] rounded-lg overflow-hidden cursor-pointer hover:border-[#8B5CF6]/60 transition-colors group"
-                title={expr.note || expr.id}
-              >
-                {preview ? (
-                  <img src={preview} alt={`${character.name} - ${expr.id}`} className="w-full h-full object-cover" />
-                ) : (
-                  <div className="w-full h-full flex flex-col items-center justify-center gap-1 px-2 text-center">
-                    <ImageIcon className="w-4 h-4 text-[#4D3A7A] group-hover:text-[#8B5CF6] transition-colors" />
-                    {expr.note && (
-                      <span className="text-[9px] text-[#4D3A7A] leading-tight line-clamp-2">{expr.note}</span>
-                    )}
+              <div key={expr.id} className="relative">
+                <label
+                  className="relative aspect-square bg-[#0B0B14] border border-[#2D1B4E] rounded-lg overflow-hidden cursor-pointer hover:border-[#8B5CF6]/60 transition-colors group block"
+                  title={expr.note || expr.id}
+                >
+                  {preview ? (
+                    <img src={preview} alt={`${character.name} - ${expr.id}`} className="w-full h-full object-cover" />
+                  ) : (
+                    <div className="w-full h-full flex flex-col items-center justify-center gap-1 px-2 text-center">
+                      <ImageIcon className="w-4 h-4 text-[#4D3A7A] group-hover:text-[#8B5CF6] transition-colors" />
+                      {expr.note && (
+                        <span className="text-[9px] text-[#4D3A7A] leading-tight line-clamp-2">{expr.note}</span>
+                      )}
+                    </div>
+                  )}
+                  <div className="absolute bottom-0 inset-x-0 bg-black/75 backdrop-blur-sm text-white text-[9px] py-1 text-center font-bold tracking-widest uppercase">
+                    {expr.id}
                   </div>
-                )}
-                <div className="absolute bottom-0 inset-x-0 bg-black/75 backdrop-blur-sm text-white text-[9px] py-1 text-center font-bold tracking-widest uppercase">
-                  {expr.id}
-                </div>
-                <input
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={(e) => onUpload(expr.id, e.target.files?.[0])}
-                />
-              </label>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) => onUpload(expr.id, e.target.files?.[0])}
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); onCopyPrompt(character, expr); }}
+                  title="Copy art prompt for this expression"
+                  className={`absolute top-1 right-1 w-5 h-5 rounded-full flex items-center justify-center transition-colors z-10 ${
+                    justCopied ? 'bg-[#10B981] text-white' : 'bg-black/70 text-[#C4B5FD] hover:bg-[#8B5CF6] hover:text-white'
+                  }`}
+                >
+                  {justCopied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                </button>
+              </div>
             );
           })}
         </div>
@@ -1046,22 +1108,18 @@ export default function CreatorApp() {
             </p>
           </div>
 
-          <label className="flex items-start gap-4 bg-[#120F24] border border-[#2D1B4E] rounded-2xl p-5 cursor-pointer mt-4">
+          <div className="flex items-start gap-4 bg-[#120F24] border border-[#2D1B4E] rounded-2xl p-5 mt-4">
             <div className="pt-0.5">
-               <input
-                 type="checkbox"
-                 checked={runEvaluation}
-                 onChange={(e) => setRunEvaluation(e.target.checked)}
-                 className="w-5 h-5 accent-[#8B5CF6] rounded-md border-[#4D3A7A] bg-[#0B0B14]"
-               />
+              <Scale className="w-5 h-5 text-[#A78BFA]" />
             </div>
             <div className="flex-1">
-              <span className="text-[15px] font-bold text-white block mb-1">Run AI Quality Judge</span>
+              <span className="text-[15px] font-bold text-white block mb-1">AI Quality Judge — always on</span>
               <span className="text-[13px] text-[#8A7DAB] block leading-relaxed">
-                Adds an extra API call to evaluate the final draft. Turn off to save quota on free-tier keys.
+                Every draft is automatically reviewed after generation. If it fails the judge, the engine regenerates the whole
+                story once from the same World Bible before handing it back to you.
               </span>
             </div>
-          </label>
+          </div>
         </div>
       </div>
       <div className="px-6 pb-8 pt-4 flex-shrink-0 max-w-md mx-auto w-full">
@@ -1223,6 +1281,7 @@ export default function CreatorApp() {
               <p className="text-[11px] text-[#4D3A7A] italic mb-3 pl-1 leading-relaxed">
                 One row per canonical character. Upload a portrait for each expression the story uses —
                 unfilled expressions fall back to <span className="text-[#8A7DAB] not-italic font-bold">neutral</span> at play time.
+                Tap the small copy icon on a tile to grab a ready-to-paste art prompt for that expression.
               </p>
               <div className="space-y-3">
                 {(assetManifest?.characters || []).map(c => (
@@ -1231,6 +1290,8 @@ export default function CreatorApp() {
                     character={c}
                     uploadedByExpr={assetFiles.characters[c.name]}
                     onUpload={(exprId, file) => handleAssetFileChange('characters', c.name, file, exprId)}
+                    onCopyPrompt={handleCopyExpressionPrompt}
+                    copiedKey={copiedExpr}
                   />
                 ))}
               </div>
@@ -1270,7 +1331,7 @@ export default function CreatorApp() {
             <Play className="w-5 h-5 fill-current" /> Play Test
           </button>
           <button
-            onClick={handlePublish}
+            onClick={() => setShowPublishConfirm(true)}
             disabled={!hasCompletedPlaythrough || isSavingDraft || !!publishedStoryId}
             title={!hasCompletedPlaythrough ? "Play test through to an ending before publishing" : ""}
             className="flex-1 bg-gradient-to-r from-[#9333EA] to-[#7C3AED] hover:from-[#A855F7] hover:to-[#8B5CF6] disabled:from-[#2D1B4E] disabled:to-[#2D1B4E] disabled:text-[#8A7DAB] disabled:opacity-80 disabled:cursor-not-allowed text-white py-[18px] rounded-full font-bold text-[17px] shadow-[0_0_20px_rgba(139,92,246,0.3)] transition-all flex items-center justify-center gap-2"
@@ -1425,8 +1486,32 @@ export default function CreatorApp() {
           provider={provider}
           apiKey={apiKey}
           modelName={modelName}
-          onPublish={handlePublish}
+          onPublish={() => setShowPublishConfirm(true)}
         />
+      )}
+
+      {showPublishConfirm && (
+        <div className="fixed inset-0 z-[1000] bg-black/80 backdrop-blur-sm flex items-center justify-center p-6" onClick={() => setShowPublishConfirm(false)}>
+          <div className="bg-[#13132B] w-full max-w-sm rounded-3xl p-8 text-center shadow-2xl border border-[#2D1B4E]" onClick={e => e.stopPropagation()}>
+            <div className="w-16 h-16 rounded-full bg-[#2D1B4E] flex items-center justify-center mx-auto mb-6 shadow-inner">
+              <CheckCircle2 className="text-white w-8 h-8" />
+            </div>
+            <h3 className="text-white font-bold mb-2 text-lg leading-snug">Publish this story?</h3>
+            <p className="text-[#8A7DAB] text-[13px] leading-relaxed mb-8">
+              "{title}{subtitle ? `: ${subtitle}` : ''}" will go live in the public catalog immediately and become playable by anyone using the app.
+            </p>
+            <div className="flex gap-4">
+              <button onClick={() => setShowPublishConfirm(false)} className="flex-1 bg-[#2D1B4E] hover:bg-[#3B0764] text-white py-4 rounded-xl font-bold transition">Cancel</button>
+              <button
+                onClick={() => { setShowPublishConfirm(false); handlePublish(); }}
+                disabled={isSavingDraft}
+                className="flex-1 py-4 rounded-xl font-bold text-white shadow-lg transition bg-[#8B5CF6] hover:bg-[#7C3AED] disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {isSavingDraft && <Loader2 className="w-4 h-4 animate-spin" />} Publish
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -1512,12 +1597,21 @@ function PlayTestEngine({
     }
   };
 
+  // FIX: previously this navigated to whatever `nextSceneId` a choice
+  // carried without checking it actually existed as a scene. A dangling
+  // reference (a hallucinated or typo'd scene id from generation) would
+  // silently fall through to the `currentScene` lookup's `scenes[0]`
+  // fallback above — which looked exactly like the story "looping back to
+  // the beginning" instead of reaching an ending. Now an unresolvable
+  // target is treated as a real dead end and surfaced clearly, instead of
+  // silently resetting progress.
   const handleChoice = (nextSceneId) => {
-    if (nextSceneId) {
+    const targetExists = !!nextSceneId && storyData?.scenes?.some(s => s.id === nextSceneId);
+    if (targetExists) {
       setCurrentSceneId(nextSceneId);
       setSequenceIndex(0);
     } else {
-      setPlayerError("Dead End: this choice has no next_scene set.");
+      setPlayerError("Dead End: this choice has no valid next_scene set.");
     }
   };
 
