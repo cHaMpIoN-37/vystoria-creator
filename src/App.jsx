@@ -2404,9 +2404,9 @@ function CreatorApp({ session, onSignOut }) {
           </button>
         </div>
       )}
-    </div>
-  );
-
+        </div>
+    );
+  };
   const JUDGE_RUBRIC_META = {
     choice_impact:    { label: 'Choice Impact & Agency', weight: '30%', minPass: 7.0 },
     lore_consistency: { label: 'Lore Consistency',        weight: '20%', minPass: 8.0 },
@@ -2582,7 +2582,6 @@ function CreatorApp({ session, onSignOut }) {
       )}
     </div>
     );
-  };
 }
 
 /*
