@@ -101,6 +101,116 @@ const IMAGE_MODEL_PLACEHOLDERS = {
   openai: 'Leave blank for gpt-image-1',
 };
 
+//// ---------------------------------------------------------------------------
+// ART PROMPT COMPOSITION
+//
+// This is the SINGLE source of truth for what an image prompt looks like.
+// The Copy button and the Generate button both run everything through
+// composeImagePrompt(), so what lands on your clipboard is exactly what the
+// engine would have sent — paste it into ChatGPT or Gemini and you get the
+// same picture. The backend no longer appends anything of its own (see B27).
+//
+// The manifest's `base_description` deliberately covers the SUBJECT only —
+// who the person is, what they're wearing. Style, format and the negative
+// prompt are project-wide, so they're bolted on here instead of being
+// repeated inside forty separate descriptions.
+// ---------------------------------------------------------------------------
+
+// Image models default to "cinematic" — shallow depth of field, grain, soft
+// focus — unless told otherwise. Naming the failure modes is what suppresses
+// them; a positive "flat 2D" instruction alone does not.
+const FLAT_2D_RULES =
+  'Flat 2D illustration with clean crisp line art and hard-edged cel shading, fully in ' +
+  'focus from edge to edge. NOT 3D, NOT a render, NOT photorealistic, NOT a photograph, ' +
+  'no CGI. No depth-of-field blur, no bokeh, no motion blur, no soft focus, no haze, no ' +
+  'film grain, no noise, no lens flare, no chromatic aberration, no vignette. No text, no ' +
+  'lettering, no title, no logo, no watermark, no signature, no border, no frame, no UI.';
+
+const ASSET_FORMAT_RULES = {
+  character: {
+    label: 'Character portrait',
+    format: 'Aspect ratio 3:4 (vertical portrait). Suggested size 1024 × 1365 px, PNG with transparency.',
+    composition:
+      'Full-body reference of ONE single figure, standing, facing the viewer, in a neutral ' +
+      'relaxed pose. Figure centred, with the whole body from the top of the head to the ' +
+      'soles of the feet inside the frame and clear margin above and below — do not crop ' +
+      'the head or the feet.\n' +
+      'COMPLETELY TRANSPARENT BACKGROUND. Nothing at all behind the figure: no scenery, no ' +
+      'room, no floor, no ground, no cast shadow, no drop shadow, no colour fill, no ' +
+      'gradient, no backdrop, no props. Clean sharp silhouette edges, ready to cut out and ' +
+      'composite over a scene.\n' +
+      'One figure only — no turnaround sheet, no multiple poses, no side or back views, no ' +
+      'reference grid, no colour swatches, no speech bubbles.',
+  },
+  background: {
+    label: 'Scene background',
+    format: 'Aspect ratio 16:9 (landscape). Suggested size 1920 × 1080 px.',
+    composition:
+      'Empty environment artwork. Wide establishing shot at roughly eye level.\n' +
+      'ABSOLUTELY NO PEOPLE: no characters, no figures, no silhouettes, no crowds, no ' +
+      'animals, no faces. This is an empty stage that characters are drawn on top of ' +
+      'afterwards.\n' +
+      'Keep the important detail in the upper two thirds and the left half of the frame. At ' +
+      'runtime the bottom third is covered by the dialogue box and the right third by a ' +
+      'character portrait, so those regions must stay visually quiet.',
+  },
+  cover: {
+    label: 'Cover / key art',
+    format: 'Aspect ratio 4:3 (landscape). Suggested size 1600 × 1200 px.',
+    composition:
+      'Poster-style key art with ONE clear focal subject placed dead centre.\n' +
+      'CRITICAL SAFE ZONE: every essential element — the subject\'s face, the focal object, ' +
+      'the silhouette — must sit inside a centred square occupying the middle of the frame. ' +
+      'The app crops this image to tall 3:4, square 1:1 and wide 16:9 on different screens, ' +
+      'so anything near the left or right edges or the extreme top or bottom WILL be cut ' +
+      'off. Treat the outer margins as atmosphere only.\n' +
+      'Bold readable silhouette that still works shrunk to a thumbnail. Leave the image ' +
+      'completely free of lettering — the app draws the title itself, and baked-in text ' +
+      'renders as garbled glyphs.',
+  },
+};
+
+// Folder name in assetFiles -> rule key.
+const ASSET_KIND_FOR = { characters: 'character', backgrounds: 'background', cover: 'cover' };
+
+const composeImagePrompt = ({ subject, style, kind }) => {
+  const rules = ASSET_FORMAT_RULES[kind] || ASSET_FORMAT_RULES.character;
+  const blocks = [
+    `SUBJECT\n${(subject || '').trim() || '(no description available — write one yourself)'}`,
+  ];
+  if (style && style.trim()) blocks.push(`ART STYLE\n${style.trim()}`);
+  blocks.push(`FORMAT\n${rules.format}`);
+  blocks.push(`COMPOSITION\n${rules.composition}`);
+  blocks.push(`MUST NOT INCLUDE\n${FLAT_2D_RULES}`);
+  return blocks.join('\n\n');
+};
+
+// navigator.clipboard needs a secure context, and the Android WebView can
+// refuse it outright. Fall back to the old execCommand trick so the button
+// isn't dead on a phone.
+const copyTextToClipboard = async (text) => {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (err) { /* fall through */ }
+  try {
+    const helper = document.createElement('textarea');
+    helper.value = text;
+    helper.setAttribute('readonly', '');
+    helper.style.position = 'fixed';
+    helper.style.opacity = '0';
+    document.body.appendChild(helper);
+    helper.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(helper);
+    return ok;
+  } catch (err) {
+    return false;
+  }
+};
+
 // What the free tiers actually allow per day, so the pre-flight estimate can
 // say something useful instead of an abstract number.
 const PROVIDER_DAILY_HINT = {
@@ -1017,6 +1127,7 @@ function CreatorApp({ session, onSignOut }) {
     setGeneratingAssetKey(tileKey);
     setAssetGenError(null);
     try {
+      const assetKind = ASSET_KIND_FOR[kind] || 'character';
       const response = await fetch(`${BACKEND_URL}/generate-image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1024,9 +1135,14 @@ function CreatorApp({ session, onSignOut }) {
           provider: imageProvider,
           api_key: imageApiKey,
           model_name: imageModel.trim() || null,
-          prompt: promptText.trim(),
-          kind: kind === 'characters' ? 'character' : (kind === 'cover' ? 'cover' : 'background'),
-          style: artStyle.trim() || null,
+          // Fully composed here, and `compose: false` tells the backend to
+          // send it through untouched. That guarantees Copy and Generate are
+          // byte-identical — otherwise the two paths drift the first time
+          // either side's wording is edited.
+          prompt: composeImagePrompt({ subject: promptText, style: artStyle, kind: assetKind }),
+          kind: assetKind,
+          style: null,
+          compose: false,
         }),
       });
 
@@ -1146,22 +1262,34 @@ function CreatorApp({ session, onSignOut }) {
     }
   };
 
-  // Copies a ready-to-paste art prompt for one character expression to the
-  // clipboard — the character's base description plus that expression's
-  // specific note — so it can be dropped straight into an external image
-  // generator instead of retyping the description by hand.
-  const handleCopyExpressionPrompt = async (character, expr) => {
-    const promptText = [character.base_description || character.description, expr.note]
+  // Copies a COMPLETE, self-contained art prompt — subject, house style,
+  // aspect ratio, composition rules and negative prompt. Paste it into
+  // ChatGPT, Gemini, Midjourney or anything else and you get the same image
+  // the Generate button would have produced, because both call the same
+  // composer.
+  const handleCopyAssetPrompt = async (kind, key, subject, expressionId = null) => {
+    const text = composeImagePrompt({
+      subject,
+      style: artStyle,
+      kind: ASSET_KIND_FOR[kind] || 'character',
+    });
+    const tileKey = expressionId ? `${key}__${expressionId}` : `${kind}__${key}`;
+    const ok = await copyTextToClipboard(text);
+    if (!ok) {
+      setAssetGenError('Could not reach the clipboard. Open the tile and select the text by hand.');
+      return;
+    }
+    setCopiedExpr(tileKey);
+    setTimeout(() => setCopiedExpr(prev => (prev === tileKey ? null : prev)), 1500);
+  };
+
+  // Kept as a thin wrapper so CharacterAssetCard's existing call signature
+  // (character, expr) doesn't have to change.
+  const handleCopyExpressionPrompt = (character, expr) => {
+    const subject = [character.base_description || character.description, expr.note]
       .filter(Boolean)
       .join(' — ');
-    try {
-      await navigator.clipboard.writeText(promptText);
-      const key = `${character.name}__${expr.id}`;
-      setCopiedExpr(key);
-      setTimeout(() => setCopiedExpr(prev => (prev === key ? null : prev)), 1500);
-    } catch (err) {
-      console.error('Copy failed:', err);
-    }
+    return handleCopyAssetPrompt('characters', character.name, subject, expr.id);
   };
 
   //  // A simple flat row used for backgrounds and cover art. Characters get
@@ -1170,7 +1298,8 @@ function CreatorApp({ session, onSignOut }) {
   //
   // Each row now offers Generate (AI) alongside Upload, using the same
   // description text the Copy button hands to an external tool.
-  const AssetRow = ({ id, description, preview, onFile, onGenerate, isGenerating, canGenerate }) => {
+  const AssetRow = ({ id, description, preview, onFile, onGenerate, isGenerating,
+                      canGenerate, onCopy, justCopied }) => {
     const [showModal, setShowModal] = useState(false);
     return (
       <>
@@ -1190,6 +1319,18 @@ function CreatorApp({ session, onSignOut }) {
             <p className="text-[#8A7DAB] text-[13px] leading-snug line-clamp-2 mt-1">{description || 'No description generated.'}</p>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0" onClick={e => e.stopPropagation()}>
+            <button
+              type="button"
+              onClick={onCopy}
+              title="Copy the full art prompt — style, aspect ratio and all — ready to paste anywhere"
+              className={`border text-xs font-bold px-3 py-2.5 rounded-xl transition-colors flex items-center gap-2 ${
+                justCopied
+                  ? 'bg-[#10B981] border-[#10B981] text-white'
+                  : 'bg-transparent border-[#4D3A7A] hover:border-[#8B5CF6] text-[#C4B5FD] hover:bg-[#2D1B4E]'
+              }`}
+            >
+              {justCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+            </button>
             <button
               type="button"
               onClick={onGenerate}
@@ -1215,10 +1356,22 @@ function CreatorApp({ session, onSignOut }) {
                 <h3 className="text-white text-xl font-bold">{id}</h3>
                 <button onClick={() => setShowModal(false)} className="w-8 h-8 bg-[#1C1635] rounded-full flex items-center justify-center hover:bg-[#2D1B4E] transition-colors"><X className="text-[#8A7DAB] w-4 h-4" /></button>
               </div>
-              <div className="bg-[#0B0B14] border border-[#1C1635] rounded-xl p-4 mb-6">
-                 <p className="text-[#C4B5FD] text-[15px] leading-relaxed select-all">{description || 'No description generated.'}</p>
+              <div className="bg-[#0B0B14] border border-[#1C1635] rounded-xl p-4 mb-6 max-h-56 overflow-y-auto">
+                 <p className="text-[#C4B5FD] text-[15px] leading-relaxed select-all whitespace-pre-line">{description || 'No description generated.'}</p>
               </div>
               <div className="flex flex-col gap-3">
+                <button
+                  type="button"
+                  onClick={onCopy}
+                  className={`w-full font-bold py-3.5 rounded-xl transition-colors flex items-center justify-center gap-2 border ${
+                    justCopied
+                      ? 'bg-[#10B981] border-[#10B981] text-white'
+                      : 'bg-transparent border-[#4D3A7A] hover:border-[#8B5CF6] hover:bg-[#1C1635] text-white'
+                  }`}
+                >
+                  {justCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                  {justCopied ? 'Copied full prompt' : 'Copy full art prompt'}
+                </button>
                 <button
                   type="button"
                   onClick={() => { onGenerate(); setShowModal(false); }}
@@ -1325,7 +1478,7 @@ function CreatorApp({ session, onSignOut }) {
                   <button
                     type="button"
                     onClick={(e) => { e.preventDefault(); e.stopPropagation(); onCopyPrompt(character, expr); }}
-                    title="Copy art prompt for this expression"
+                    title="Copy the full art prompt — style, aspect ratio, transparent background and all"
                     className={`w-5 h-5 rounded-full flex items-center justify-center transition-colors ${
                       justCopied ? 'bg-[#10B981] text-white' : 'bg-black/70 text-[#C4B5FD] hover:bg-[#8B5CF6] hover:text-white'
                     }`}
@@ -2075,7 +2228,13 @@ function CreatorApp({ session, onSignOut }) {
     </div>
   );
 
-  const renderAssets = () => (
+  const renderAssets = () => {
+    // Computed once so the Copy button, the Generate button and the row's
+    // visible text can never disagree about what the cover is meant to be.
+    const coverDescription = assetManifest?.cover?.description
+      || `Poster-style key art for "${title}" — ${genre}, ${tone}.`;
+
+    return (
     <div className="flex flex-col h-full bg-[#0B0B14]">
       <div className="flex-1 overflow-y-auto px-6 pt-12 pb-6 max-w-md mx-auto w-full">
         <ScreenHeader title="Story Assets" subtitleText="Attach art, play-test end to end, then save." />
@@ -2198,6 +2357,8 @@ function CreatorApp({ session, onSignOut }) {
                     onGenerate={() => handleGenerateAsset('backgrounds', b.id, b.description)}
                     isGenerating={generatingAssetKey === `backgrounds__${b.id}`}
                     canGenerate={!!imageApiKey}
+                    onCopy={() => handleCopyAssetPrompt('backgrounds', b.id, b.description)}
+                    justCopied={copiedExpr === `backgrounds__${b.id}`}
                   />
                 ))}
               </div>
@@ -2210,16 +2371,14 @@ function CreatorApp({ session, onSignOut }) {
               <div className="space-y-3 pb-4">
                 <AssetRow
                   id="Cover Image"
-                  description={assetManifest?.cover?.description || `Poster-style key art for "${title}" — ${genre}, ${tone}.`}
+                  description={coverDescription}
                   preview={assetFiles.cover.cover?.previewUrl || assetFiles.cover.cover?.uploadedUrl}
                   onFile={(f) => handleAssetFileChange('cover', 'cover', f)}
-                  onGenerate={() => handleGenerateAsset(
-                    'cover',
-                    'cover',
-                    assetManifest?.cover?.description || `Poster-style key art for "${title}" — ${genre}, ${tone}.`
-                  )}
+                  onGenerate={() => handleGenerateAsset('cover', 'cover', coverDescription)}
                   isGenerating={generatingAssetKey === 'cover__cover'}
                   canGenerate={!!imageApiKey}
+                  onCopy={() => handleCopyAssetPrompt('cover', 'cover', coverDescription)}
+                  justCopied={copiedExpr === 'cover__cover'}
                 />
               </div>
             </div>
@@ -2422,7 +2581,8 @@ function CreatorApp({ session, onSignOut }) {
         </div>
       )}
     </div>
-  );
+    );
+  };
 }
 
 /*
