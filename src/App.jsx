@@ -52,7 +52,7 @@ import {
   Cpu, BookOpen, Terminal, Scale, Image as ImageIcon, Sparkles, Loader2, Key,
   Play, CheckCircle2, AlertTriangle, RefreshCw, XCircle, MinusCircle, ChevronDown,
   ArrowLeft, Menu, ArrowRight, Save, Download, X, Wand2, FileText, RotateCcw,
-  Copy, Check
+  Copy, Check, Star, Globe, LogOut, PlayCircle, Palette
 } from 'lucide-react';
 
 // --- SUPABASE CONFIGURATION (Same as the player app) ---
@@ -89,6 +89,56 @@ const MODEL_PLACEHOLDERS = {
   grok: 'Leave blank for the recommended default, or paste e.g. grok-2-latest',
 };
 
+// Asset art runs on its own provider + key so portrait generation can't eat
+// the story engine's daily request allowance (and vice versa).
+const IMAGE_PROVIDER_LABELS = {
+  gemini: 'Google Gemini (images)',
+  openai: 'OpenAI (images)',
+};
+
+const IMAGE_MODEL_PLACEHOLDERS = {
+  gemini: 'Leave blank for gemini-2.5-flash-image',
+  openai: 'Leave blank for gpt-image-1',
+};
+
+// What the free tiers actually allow per day, so the pre-flight estimate can
+// say something useful instead of an abstract number.
+const PROVIDER_DAILY_HINT = {
+  gemini: 20,
+  openai: null,
+  claude: null,
+  grok: null,
+};
+
+const JUDGE_MODES = [
+  { value: 'advisory', label: 'Advisory (recommended)', cost: '+1 call',
+    blurb: 'Scores the draft once and records the scorecard. Never regenerates — fix specific problems with Tweak Scene instead.' },
+  { value: 'off', label: 'Off', cost: '0 calls',
+    blurb: 'Skip the quality gate entirely. Cheapest possible run; you can still run the judge by hand later from AI Judgement.' },
+  { value: 'strict', label: 'Strict', cost: '+1, up to +N+1 on a fail',
+    blurb: 'The old behaviour: a FAIL throws every chapter away and rewrites the book once. Doubles the cost of a run — only worth it on a paid key.' },
+];
+
+// Mirrors estimate_call_count() in the backend, so the number on screen before
+// you press Initialize is the number the engine will actually spend.
+const estimateCalls = (targetLength, judgeMode) => {
+  const chapters = parseInt(String(targetLength).match(/\d+/)?.[0] || '8', 10);
+  let calls = 2 + chapters + 1;              // world bible + outline + chapters + manifest
+  if (judgeMode !== 'off') calls += 1;       // judge
+  if (judgeMode === 'strict') calls += chapters + 1; // worst-case regeneration
+  return calls;
+};
+
+// The backend hands images back as base64 so this app can push them through
+// the SAME upload path as a manual file pick — one storage layout, one place
+// that writes draft_assets, one set of RLS rules to reason about.
+const base64ToFile = (base64, mimeType, filename) => {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new File([bytes], filename, { type: mimeType || 'image/png' });
+};
+
 // Helper: pull a portrait URL out of a character's asset entry for a given
 // expression, falling back to neutral, then to any available variant. Used
 // by the PlayTestEngine to render the right face for each line.
@@ -108,7 +158,36 @@ const pickPortraitFromEntry = (charEntry, expression) => {
   return null;
 };
 
-export default function CreatorApp() {
+// Rebuilds an asset manifest from a finished story when we're editing a
+// published story whose original generation_tasks row is gone (published from
+// another machine, or the draft was cleaned up). Descriptions are empty —
+// the art itself is already attached, and Tweak Scene doesn't need them.
+const deriveManifestFromStory = (storyJson) => {
+  const speakers = {};
+  const backgrounds = new Set();
+  for (const scene of storyJson?.scenes || []) {
+    if (scene.background) backgrounds.add(scene.background);
+    for (const block of scene.sequence || []) {
+      if (block.type === 'dialogue' && block.speaker) {
+        speakers[block.speaker] = speakers[block.speaker] || new Set();
+        speakers[block.speaker].add(block.expression || 'neutral');
+      }
+    }
+  }
+  return {
+    characters: Object.entries(speakers).map(([name, exprs]) => ({
+      name,
+      base_description: '',
+      expressions: [...exprs].sort().map(id => ({ id, note: '' })),
+    })),
+    backgrounds: [...backgrounds].sort().map(id => ({ id, description: '' })),
+    cover: { description: '' },
+  };
+};
+
+// Now takes a session: the studio is shared across devices, so every write
+// has to be attributable to a real creator account (see F17).
+function CreatorApp({ session, onSignOut }) {
   // Navigation
   const [currentView, setCurrentView] = useState('home'); // home, engine_config, novel_parameters, console, judgement, assets, library
 
@@ -125,6 +204,45 @@ export default function CreatorApp() {
   // deploy. The creator can still paste any model ID they want — Gemini,
   // OpenAI, Claude, Grok, anything the key has access to.
   const [modelName, setModelName] = useState('');
+
+  // --- Quota controls -------------------------------------------------
+  // 'advisory' | 'off' | 'strict'. See JUDGE_MODES. Advisory is the default
+  // because the old always-on strict behaviour silently doubled the cost of
+  // every run that scored below 7.5.
+  const [judgeMode, setJudgeMode] = useState('advisory');
+  // Asked-for scenes per chapter. Lower = less chance of overrunning the
+  // model's output-token ceiling, which is what produced most "JSON error"
+  // retries (and every retry is a request off the daily allowance).
+  const [scenesPerChapter, setScenesPerChapter] = useState(14);
+  // Hard stop on model calls for one run. 0 = no ceiling.
+  const [maxLlmCalls, setMaxLlmCalls] = useState(0);
+
+  // --- Asset art (separate provider + key from the story engine) -------
+  const [imageProvider, setImageProvider] = useState('gemini');
+  const [imageApiKey, setImageApiKey] = useState('');
+  const [imageModel, setImageModel] = useState('');
+  const [artStyle, setArtStyle] = useState(
+    'Moody painterly anime key art, cool desaturated palette, dramatic rim lighting, high detail'
+  );
+  const [generatingAssetKey, setGeneratingAssetKey] = useState(null);
+  const [assetGenError, setAssetGenError] = useState(null);
+
+  // --- Checkpoint / resume --------------------------------------------
+  const [checkpointProgress, setCheckpointProgress] = useState(null);
+  const [failureKind, setFailureKind] = useState(null);
+  const [isResuming, setIsResuming] = useState(false);
+
+  // --- Published-story editing ----------------------------------------
+  // Non-null means "this session is editing an already-published story";
+  // Publish becomes Re-publish and updates the existing catalog row instead
+  // of inserting a second one.
+  const [editingStoryId, setEditingStoryId] = useState(null);
+  const [editingStoryUrl, setEditingStoryUrl] = useState(null);
+
+  // --- Library ---------------------------------------------------------
+  const [libraryTab, setLibraryTab] = useState('drafts'); // 'drafts' | 'published'
+  const [publishedStories, setPublishedStories] = useState([]);
+  const [featuringId, setFeaturingId] = useState(null);
 
   // Story Parameter States
   const [title, setTitle] = useState('');
@@ -195,14 +313,24 @@ export default function CreatorApp() {
   }, [logs]);
 
   // Polling Supabase for Background Task Updates (runs regardless of which screen is open)
+  //
+  // Explicit column list, not select('*'). The task row now carries a
+  // `checkpoint` column holding every generated chapter — pulling that down
+  // every 2 seconds would be megabytes of scene JSON per minute. We read the
+  // small `checkpoint_progress` summary instead.
+  const TASK_POLL_COLUMNS =
+    'id, status, progress_percent, current_step, logs, result_json, asset_manifest, ' +
+    'evaluation_scorecard, world_bible, published_story_id, playtest_completed, ' +
+    'checkpoint_progress, failure_kind, provider, title, created_at';
+
   useEffect(() => {
     let pollInterval;
 
     if (taskId && ['pending', 'generating'].includes(taskStatus)) {
       pollInterval = setInterval(async () => {
-        const { data, error } = await supabase
+        const { data } = await supabase
           .from('generation_tasks')
-          .select('*')
+          .select(TASK_POLL_COLUMNS)
           .eq('id', taskId)
           .single();
 
@@ -211,6 +339,8 @@ export default function CreatorApp() {
           setProgress(data.progress_percent);
           setCurrentStep(data.current_step);
           setLogs(data.logs || []);
+          setCheckpointProgress(data.checkpoint_progress || null);
+          setFailureKind(data.failure_kind || null);
           if (data.result_json) setResultJson(data.result_json);
           if (data.asset_manifest) setAssetManifest(data.asset_manifest);
           if (data.evaluation_scorecard) setEvaluationScorecard(data.evaluation_scorecard);
@@ -221,6 +351,14 @@ export default function CreatorApp() {
 
     return () => clearInterval(pollInterval);
   }, [taskId, taskStatus]);
+
+  // A failed run is resumable when the engine banked anything worth keeping.
+  // This is what turns "429 on chapter 7" from a lost day into a pause.
+  const canResume = taskStatus === 'failed'
+    && !!taskId
+    && !!checkpointProgress?.has_world_bible;
+
+
 
   // --- Workflow locking -----------------------------------------------
   // Once a generation task is actively running or has finished
@@ -259,28 +397,47 @@ export default function CreatorApp() {
     setReferenceText('');
     setReferenceFileName('');
     setReferenceError('');
+    setCheckpointProgress(null);
+    setFailureKind(null);
+    setEditingStoryId(null);
+    setEditingStoryUrl(null);
+    setAssetGenError(null);
   };
 
+  // Where uploaded art lands in the bucket. Normally the task id; when
+  // editing a story whose original draft row no longer exists, a stable
+  // story-scoped folder so re-publishing twice doesn't scatter files.
+  const assetScopeId = taskId || (editingStoryId ? `story_${editingStoryId}` : null);
+
+  // Publishes a fresh story, OR re-publishes one already in the catalog when
+  // `editingStoryId` is set (opened from Story Library → Published).
+  //
+  // Re-publish writes a NEW json filename every time rather than upserting
+  // over the old one. The player app resolves a story by the filename it
+  // derives from `stories.url` and downloads through Storage, so reusing a
+  // path means readers can be served a cached copy of the previous version
+  // for hours. A new name makes the swap atomic and instant.
   const handlePublish = async () => {
-    if (!resultJson || !taskId) return;
-    setIsSavingDraft(true); // reuse the loading state
+    if (!resultJson) return;
+    setIsSavingDraft(true);
 
     try {
-      const slug = `${title}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-      // NEW: characters is nested by expression too. Shape:
-      //   assets.characters = { "Amara": { neutral: url, angry: url }, ... }
+      const { data: { session: activeSession } } = await supabase.auth.getSession();
+      if (!activeSession) throw new Error('Your session expired — sign in again.');
+      const user = activeSession.user;
+
+      const isEdit = !!editingStoryId;
+      const slugBase = `${title}-${editingStoryId || Date.now()}`
+        .toLowerCase().replace(/[^a-z0-9]+/g, '_');
+
       const assets = { backgrounds: {}, characters: {} };
 
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) throw new Error('No active session.');
-
-      // Upload backgrounds — reuse an already-uploaded draft URL if we have
-      // one, otherwise upload fresh.
+      // Backgrounds — reuse an already-uploaded URL, otherwise upload fresh.
       for (const [bgId, entry] of Object.entries(assetFiles.backgrounds)) {
         let url = entry.uploadedUrl;
         if (!url && entry.file) {
           const ext = entry.file.name.split('.').pop();
-          const path = `assets/${slug}/backgrounds/${bgId}.${ext}`;
+          const path = `assets/${slugBase}/backgrounds/${bgId}.${ext}`;
           const { error } = await supabase.storage.from('visual-novels').upload(path, entry.file, { upsert: true });
           if (error) throw new Error(`Background upload failed (${bgId}): ${error.message}`);
           url = supabase.storage.from('visual-novels').getPublicUrl(path).data.publicUrl;
@@ -288,10 +445,7 @@ export default function CreatorApp() {
         if (url) assets.backgrounds[bgId] = url;
       }
 
-      // Upload characters — iterate the nested {charName: {expr: entry}} shape.
-      // Each expression variant becomes its own file, and the finished map
-      // stored on the story row looks like:
-      //   { "Amara": { "neutral": "https://...", "worried": "https://..." } }
+      // Characters — nested {charName: {expr: entry}}.
       for (const [charName, expressionMap] of Object.entries(assetFiles.characters)) {
         if (!expressionMap || typeof expressionMap !== 'object') continue;
         assets.characters[charName] = {};
@@ -302,68 +456,120 @@ export default function CreatorApp() {
             const ext = entry.file.name.split('.').pop();
             const safeName = charName.toLowerCase().replace(/[^a-z0-9]+/g, '_');
             const safeExpr = expr.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-            const path = `assets/${slug}/characters/${safeName}_${safeExpr}.${ext}`;
+            const path = `assets/${slugBase}/characters/${safeName}_${safeExpr}.${ext}`;
             const { error } = await supabase.storage.from('visual-novels').upload(path, entry.file, { upsert: true });
             if (error) throw new Error(`Character upload failed (${charName}/${expr}): ${error.message}`);
             url = supabase.storage.from('visual-novels').getPublicUrl(path).data.publicUrl;
           }
           if (url) assets.characters[charName][expr] = url;
         }
-        // If the creator uploaded nothing at all for this character, drop the
-        // empty object so the player app's fallback logic doesn't trip on it.
         if (Object.keys(assets.characters[charName]).length === 0) {
           delete assets.characters[charName];
         }
       }
 
-      // Upload cover — same reuse-if-already-uploaded logic.
+      // Cover.
       let coverUrl = assetFiles.cover.cover?.uploadedUrl || null;
       if (!coverUrl && assetFiles.cover.cover?.file) {
         const ext = assetFiles.cover.cover.file.name.split('.').pop();
-        const path = `assets/${slug}/cover.${ext}`;
+        const path = `assets/${slugBase}/cover_${Date.now()}.${ext}`;
         const { error } = await supabase.storage.from('visual-novels').upload(path, assetFiles.cover.cover.file, { upsert: true });
         if (error) throw new Error(`Cover upload failed: ${error.message}`);
         coverUrl = supabase.storage.from('visual-novels').getPublicUrl(path).data.publicUrl;
       }
 
-      // Upload story JSON
-      const jsonPath = `${slug}.json`;
+      // Story JSON — new object name on every publish (see the note above).
+      const jsonPath = `${slugBase}_v${Date.now()}.json`;
       const jsonBlob = new Blob([JSON.stringify(resultJson)], { type: 'application/json' });
       const { error: jsonErr } = await supabase.storage.from('visual-novels').upload(jsonPath, jsonBlob, { upsert: true });
       if (jsonErr) throw new Error(`Story JSON upload failed: ${jsonErr.message}`);
       const storyUrl = supabase.storage.from('visual-novels').getPublicUrl(jsonPath).data.publicUrl;
 
-      // Insert into public stories catalog
-      const { data: { user } } = await supabase.auth.getUser();
-      const { data: storyRow, error: insertErr } = await supabase
-        .from('stories')
-        .insert({
-          title: `${title}: ${subtitle}`,
-          url: storyUrl,
-          genre,
-          creator_id: user?.id,
-          assets,
-          cover_image: coverUrl,
-        })
-        .select()
-        .single();
+      let storyRow;
+      if (isEdit) {
+        const { data, error: updateErr } = await supabase
+          .from('stories')
+          .update({
+            title: `${title}${subtitle ? `: ${subtitle}` : ''}`,
+            url: storyUrl,
+            genre,
+            assets,
+            ...(coverUrl ? { cover_image: coverUrl } : {}),
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', editingStoryId)
+          .select()
+          .single();
+        if (updateErr) throw new Error(`Catalog update failed: ${updateErr.message}`);
+        storyRow = data;
 
-      if (insertErr) throw new Error(`Catalog insert failed: ${insertErr.message}`);
+        // Retire the previous JSON object so the bucket doesn't accumulate a
+        // version per edit. Best-effort: a failure here is cosmetic.
+        if (editingStoryUrl) {
+          const oldPath = editingStoryUrl.substring(editingStoryUrl.lastIndexOf('/') + 1);
+          if (oldPath && oldPath !== jsonPath) {
+            supabase.storage.from('visual-novels').remove([oldPath]).catch(() => {});
+          }
+        }
+        setEditingStoryUrl(storyUrl);
+      } else {
+        const { data, error: insertErr } = await supabase
+          .from('stories')
+          .insert({
+            title: `${title}: ${subtitle}`,
+            url: storyUrl,
+            genre,
+            creator_id: user?.id,
+            assets,
+            cover_image: coverUrl,
+          })
+          .select()
+          .single();
+        if (insertErr) throw new Error(`Catalog insert failed: ${insertErr.message}`);
+        storyRow = data;
+      }
 
-      // Link back to generation task
-      await supabase
-        .from('generation_tasks')
-        .update({ published_story_id: storyRow.id, status: 'published' })
-        .eq('id', taskId);
+      if (taskId) {
+        await supabase
+          .from('generation_tasks')
+          .update({ published_story_id: storyRow.id, status: 'published' })
+          .eq('id', taskId);
+      }
 
       setPublishedStoryId(storyRow.id);
+      setEditingStoryId(storyRow.id);
       setDraftSaved(true);
-      setLogs(prev => [...prev, `✅ Published! "${title}" is now live at stories.id=${storyRow.id}`]);
+      setLogs(prev => [...prev,
+        isEdit
+          ? `✅ Re-published! "${title}" updated in the live catalog (stories.id=${storyRow.id}).`
+          : `✅ Published! "${title}" is now live at stories.id=${storyRow.id}`
+      ]);
     } catch (err) {
       setLogs(prev => [...prev, `[Error] Publish failed: ${err.message}`]);
       alert(`Publish failed: ${err.message}`);
     } finally {
       setIsSavingDraft(false);
+    }
+  };
+
+  // Atomic swap via RPC — `stories.is_featured` carries a partial unique
+  // index, so clearing the old winner and setting the new one has to happen
+  // in one transaction or the second UPDATE gets rejected.
+  const handleSetFeatured = async (storyId, makeFeatured) => {
+    setFeaturingId(storyId);
+    try {
+      const { error } = makeFeatured
+        ? await supabase.rpc('set_featured_story', { p_story_id: storyId })
+        : await supabase.rpc('clear_featured_story', { p_story_id: storyId });
+      if (error) throw error;
+      setPublishedStories(prev => prev.map(s => ({
+        ...s,
+        is_featured: makeFeatured ? s.id === storyId : (s.id === storyId ? false : s.is_featured),
+      })));
+    } catch (err) {
+      alert(`Could not update the featured story: ${err.message}`);
+    } finally {
+      setFeaturingId(null);
     }
   };
 
@@ -421,16 +627,21 @@ export default function CreatorApp() {
 
   // Loads every generation_tasks row belonging to the signed-in creator,
   // newest first, for the Story Library screen.
+  // Loads EVERY studio draft, not just the signed-in creator's.
+  //
+  // This is the change that makes the studio shared. The old query filtered
+  // `.eq('creator_id', user.id)`, so a story generated on one phone was
+  // invisible on another — the database was already common, the query wasn't.
+  // RLS (see the migration) is what actually enforces "studio members only".
   const fetchMyStories = async () => {
     setIsLoadingLibrary(true);
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { setMyStories([]); return; }
       const { data, error } = await supabase
         .from('generation_tasks')
-        .select('id, title, provider, status, progress_percent, current_step, published_story_id, created_at')
-        .eq('creator_id', user.id)
-        .order('created_at', { ascending: false });
+        .select('id, title, provider, status, progress_percent, current_step, ' +
+                'published_story_id, created_at, creator_id, checkpoint_progress, failure_kind')
+        .order('created_at', { ascending: false })
+        .limit(100);
       if (error) throw error;
       setMyStories(data || []);
     } catch (err) {
@@ -441,13 +652,64 @@ export default function CreatorApp() {
     }
   };
 
+  // The published catalog — the same rows the player app reads.
+  const fetchPublishedStories = async () => {
+    setIsLoadingLibrary(true);
+    try {
+      const { data, error } = await supabase
+        .from('stories')
+        .select('id, title, genre, url, cover_image, assets, is_featured, creator_id, created_at, updated_at')
+        .order('created_at', { ascending: false })
+        .limit(100);
+      if (error) throw error;
+      setPublishedStories(data || []);
+    } catch (err) {
+      console.error('Failed to load published stories:', err);
+      setPublishedStories([]);
+    } finally {
+      setIsLoadingLibrary(false);
+    }
+  };
+
+  const openLibrary = (tab = 'drafts') => {
+    setLibraryTab(tab);
+    if (tab === 'published') fetchPublishedStories(); else fetchMyStories();
+    setCurrentView('library');
+  };
+
   // Fully rehydrates CreatorApp's state from a past generation_tasks row so
   // the creator can pick up exactly where they left off — including
   // previously-uploaded assets and playtest/publish status.
-  const resumeTask = async (task) => {
-    const { data, error } = await supabase.from('generation_tasks').select('*').eq('id', task.id).single();
-    if (error) { alert(`Could not resume: ${error.message}`); return; }
+  // Flat rehydrate (backgrounds, cover): {key: url} → {key: {previewUrl, uploadedUrl}}
+  const flatAssetEntries = (obj) => Object.fromEntries(
+    Object.entries(obj || {}).map(([k, url]) => [k, { file: null, previewUrl: url, uploadedUrl: url }])
+  );
 
+  // Nested rehydrate for characters. Supports BOTH stored shapes:
+  //   Old:  { "Amara": "https://..." }                         (single portrait)
+  //   New:  { "Amara": { "neutral": "...", "angry": "..." } }  (per-expression)
+  const nestedCharAssetEntries = (obj) => {
+    const out = {};
+    for (const [name, val] of Object.entries(obj || {})) {
+      if (typeof val === 'string') {
+        out[name] = { neutral: { file: null, previewUrl: val, uploadedUrl: val } };
+      } else if (val && typeof val === 'object') {
+        out[name] = {};
+        for (const [expr, url] of Object.entries(val)) {
+          if (typeof url === 'string') {
+            out[name][expr] = { file: null, previewUrl: url, uploadedUrl: url };
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  // Fully rehydrates CreatorApp's state from a generation_tasks row so the
+  // creator can pick up exactly where they left off — including
+  // previously-uploaded assets, playtest/publish status, and any checkpoint
+  // left behind by a quota-interrupted run.
+  const hydrateFromTaskRow = (data) => {
     setTaskId(data.id);
     setTaskStatus(data.status);
     setProgress(data.progress_percent || 0);
@@ -461,48 +723,95 @@ export default function CreatorApp() {
     setDraftSaved(!!data.published_story_id);
     setHasCompletedPlaythrough(!!data.playtest_completed);
     setProvider(data.provider || 'gemini');
+    setCheckpointProgress(data.checkpoint_progress || null);
+    setFailureKind(data.failure_kind || null);
 
     const [t, ...rest] = (data.title || '').split(':');
     setTitle((t || '').trim());
     setSubtitle(rest.join(':').trim());
 
     const draft = data.draft_assets || {};
-
-    // Flat rehydrate (backgrounds, cover): {key: url} → {key: {previewUrl, uploadedUrl}}
-    const flatEntries = (obj) => Object.fromEntries(
-      Object.entries(obj || {}).map(([k, url]) => [k, { file: null, previewUrl: url, uploadedUrl: url }])
-    );
-
-    // Nested rehydrate for characters. The draft_assets row supports BOTH shapes:
-    //   Old:  { "Amara": "https://..." }                         (single portrait per character)
-    //   New:  { "Amara": { "neutral": "...", "angry": "..." } }  (per-expression)
-    // We normalize old-shape drafts into the new shape by treating the single
-    // URL as the "neutral" variant, so nothing gets lost on resume.
-    const nestedCharEntries = (obj) => {
-      const out = {};
-      for (const [name, val] of Object.entries(obj || {})) {
-        if (typeof val === 'string') {
-          out[name] = { neutral: { file: null, previewUrl: val, uploadedUrl: val } };
-        } else if (val && typeof val === 'object') {
-          out[name] = {};
-          for (const [expr, url] of Object.entries(val)) {
-            if (typeof url === 'string') {
-              out[name][expr] = { file: null, previewUrl: url, uploadedUrl: url };
-            }
-          }
-        }
-      }
-      return out;
-    };
-
     setAssetFiles({
-      characters: nestedCharEntries(draft.characters),
-      backgrounds: flatEntries(draft.backgrounds),
-      cover: flatEntries(draft.cover),
+      characters: nestedCharAssetEntries(draft.characters),
+      backgrounds: flatAssetEntries(draft.backgrounds),
+      cover: flatAssetEntries(draft.cover),
     });
+  };
 
+  const resumeTask = async (task) => {
+    const { data, error } = await supabase.from('generation_tasks').select('*').eq('id', task.id).single();
+    if (error) { alert(`Could not resume: ${error.message}`); return; }
+
+    hydrateFromTaskRow(data);
+    setEditingStoryId(null);
+    setEditingStoryUrl(null);
     setCurrentView(['pending', 'generating'].includes(data.status) ? 'console' : 'home');
   };
+
+  // Opens an ALREADY-PUBLISHED story for editing — scene tweaks, asset swaps,
+  // then Re-publish over the same catalog row.
+  //
+  // Preferred path is the originating generation_tasks row, because it still
+  // holds the world bible (needed by Tweak Scene) and the asset manifest with
+  // its art descriptions. If that row is gone, we fall back to downloading the
+  // published JSON and deriving a bare manifest from the scenes themselves.
+  const openPublishedStory = async (story) => {
+    setIsLoadingLibrary(true);
+    try {
+      const { data: taskRow } = await supabase
+        .from('generation_tasks')
+        .select('*')
+        .eq('published_story_id', story.id)
+        .maybeSingle();
+
+      if (taskRow) {
+        hydrateFromTaskRow(taskRow);
+      } else {
+        const res = await fetch(story.url);
+        if (!res.ok) throw new Error(`Could not download the published story JSON (HTTP ${res.status}).`);
+        const storyJson = await res.json();
+
+        setTaskId(null);
+        setTaskStatus('completed');
+        setProgress(100);
+        setCurrentStep('Editing a published story');
+        setLogs([`[System] Loaded published story ${story.id} for editing (no draft row found).`]);
+        setResultJson(storyJson);
+        setAssetManifest(deriveManifestFromStory(storyJson));
+        setEvaluationScorecard(null);
+        setWorldBible(null);
+        setCheckpointProgress(null);
+        setFailureKind(null);
+
+        const [t, ...rest] = (story.title || '').split(':');
+        setTitle((t || '').trim());
+        setSubtitle(rest.join(':').trim());
+        setAssetFiles({
+          characters: nestedCharAssetEntries(story.assets?.characters),
+          backgrounds: flatAssetEntries(story.assets?.backgrounds),
+          cover: story.cover_image
+            ? { cover: { file: null, previewUrl: story.cover_image, uploadedUrl: story.cover_image } }
+            : {},
+        });
+      }
+
+      setGenre(story.genre || 'Uncategorized');
+      setPublishedStoryId(story.id);
+      setEditingStoryId(story.id);
+      setEditingStoryUrl(story.url);
+      setDraftSaved(true);
+      // Already live and already play-tested once — don't force a second
+      // full playthrough before an edit can go back out.
+      setHasCompletedPlaythrough(true);
+      setCurrentView('assets');
+    } catch (err) {
+      alert(`Could not open that story for editing: ${err.message}`);
+    } finally {
+      setIsLoadingLibrary(false);
+    }
+  };
+
+
 
   const handleReferenceFile = async (file) => {
     if (!file) return;
@@ -535,7 +844,10 @@ export default function CreatorApp() {
     setTaskId(null);
     setIsSubmitting(true);
     setTaskStatus('pending');
-    setLogs(['[System] Sending configuration to the Vystoria Engine...']);
+    setLogs([
+      `[System] Sending configuration to the Vystoria Engine — ` +
+      `~${estimateCalls(targetLength, judgeMode)} model calls budgeted for this run.`
+    ]);
     setProgress(0);
     setCurrentStep('');
     setEvaluationScorecard(null);
@@ -546,23 +858,22 @@ export default function CreatorApp() {
     setDraftSaved(false);
     setHasCompletedPlaythrough(false);
     setHasTested(false);
+    setCheckpointProgress(null);
+    setFailureKind(null);
+    setEditingStoryId(null);
+    setEditingStoryUrl(null);
 
     try {
-      let userId;
+      // The anonymous-sign-in fallback is gone on purpose. Each anonymous
+      // session is a brand-new auth.users row, so a story generated on your
+      // phone belonged to a *different* user than one generated on your
+      // mentor's — which is precisely why the library never lined up across
+      // devices. A shared studio needs a shared, real identity.
       const { data: { user }, error: userError } = await supabase.auth.getUser();
-      if (user && !userError) {
-        userId = user.id;
-      } else {
-        await supabase.auth.signOut();
-        const { data: anonData, error: anonError } = await supabase.auth.signInAnonymously();
-        if (anonError) {
-          throw new Error(
-            `Could not create an anonymous creator account: ${anonError.message}. ` +
-            `Make sure "Anonymous Sign-Ins" is enabled in Supabase → Authentication → Providers.`
-          );
-        }
-        userId = anonData.user.id;
+      if (!user || userError) {
+        throw new Error('Your session expired. Sign out and back in, then try again.');
       }
+      const userId = user.id;
 
       const response = await fetch(`${BACKEND_URL}/generate`, {
         method: 'POST',
@@ -578,7 +889,11 @@ export default function CreatorApp() {
           tone,
           idea: idea.trim() || null,
           reference_text: referenceText.trim() || null,
-          user_id: userId
+          user_id: userId,
+          // Quota controls — see Engine Config.
+          judge_mode: judgeMode,
+          scenes_per_chapter: Number(scenesPerChapter) || 14,
+          max_llm_calls: Number(maxLlmCalls) || 0,
         })
       });
 
@@ -607,6 +922,112 @@ export default function CreatorApp() {
     }
   };
 
+
+  // Picks a quota-interrupted run back up from its checkpoint. Chapters
+  // already written cost nothing to restore — only what's left gets paid for.
+  // The provider/key can be different from the original run, which is how a
+  // Gemini run that hit the daily wall gets finished on an OpenAI key.
+  const handleResumeGeneration = async () => {
+    if (!taskId || !apiKey) {
+      alert('Set an API key in Engine Config first.');
+      return;
+    }
+    setIsResuming(true);
+    try {
+      const response = await fetch(`${BACKEND_URL}/resume/${taskId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider,
+          api_key: apiKey,
+          model_name: modelName.trim(),
+          judge_mode: judgeMode,
+          scenes_per_chapter: Number(scenesPerChapter) || 14,
+          max_llm_calls: Number(maxLlmCalls) || 0,
+        }),
+      });
+      if (!response.ok) {
+        let detail = `HTTP ${response.status} ${response.statusText}`;
+        try {
+          const errBody = await response.json();
+          if (errBody?.detail) detail = errBody.detail;
+        } catch (parseErr) { /* keep the status line */ }
+        throw new Error(detail);
+      }
+      const result = await response.json();
+      setTaskStatus('pending');
+      setFailureKind(null);
+      setLogs(prev => [...prev,
+        `[System] Resuming — ${result.chapters_restored} chapter(s) restored free, ` +
+        `${result.chapters_remaining} left to write.`]);
+      setCurrentView('console');
+    } catch (err) {
+      setLogs(prev => [...prev, `[Error] Resume failed: ${err.message}`]);
+      alert(`Resume failed: ${err.message}`);
+    } finally {
+      setIsResuming(false);
+    }
+  };
+
+  // Generates one asset from its own description and pushes the result
+  // through the SAME upload path a manual file pick uses, so storage layout,
+  // draft_assets bookkeeping and RLS all stay in one place.
+  const handleGenerateAsset = async (kind, key, promptText, expression = null) => {
+    const tileKey = expression ? `${key}__${expression}` : `${kind}__${key}`;
+
+    if (!imageApiKey) {
+      setAssetGenError('No image API key set. Engine Config → Asset Art.');
+      return;
+    }
+    if (!promptText || !promptText.trim()) {
+      setAssetGenError(`No description exists for "${key}" — upload art manually, or re-run the asset manifest.`);
+      return;
+    }
+    if (!assetScopeId) {
+      setAssetGenError('Nothing to attach this art to yet — generate or open a story first.');
+      return;
+    }
+
+    setGeneratingAssetKey(tileKey);
+    setAssetGenError(null);
+    try {
+      const response = await fetch(`${BACKEND_URL}/generate-image`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: imageProvider,
+          api_key: imageApiKey,
+          model_name: imageModel.trim() || null,
+          prompt: promptText.trim(),
+          kind: kind === 'characters' ? 'character' : (kind === 'cover' ? 'cover' : 'background'),
+          style: artStyle.trim() || null,
+        }),
+      });
+
+      if (!response.ok) {
+        let detail = `HTTP ${response.status} ${response.statusText}`;
+        try {
+          const errBody = await response.json();
+          if (errBody?.detail) detail = errBody.detail;
+        } catch (parseErr) { /* keep the status line */ }
+        throw new Error(detail);
+      }
+
+      const result = await response.json();
+      const ext = (result.mime_type || 'image/png').split('/')[1] || 'png';
+      const safeKey = `${key}${expression ? `_${expression}` : ''}`
+        .toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      const file = base64ToFile(result.image_base64, result.mime_type, `${safeKey}.${ext}`);
+
+      await handleAssetFileChange(kind, key, file, expression);
+      setLogs(prev => [...prev, `🎨 Generated art for ${key}${expression ? ` (${expression})` : ''}.`]);
+    } catch (err) {
+      setAssetGenError(`${key}${expression ? ` (${expression})` : ''}: ${err.message}`);
+    } finally {
+      setGeneratingAssetKey(null);
+    }
+  };
+
   const handleProviderChange = (e) => {
     const newProvider = e.target.value;
     setProvider(newProvider);
@@ -626,7 +1047,9 @@ export default function CreatorApp() {
   // nested by (character name, expression). For backgrounds and cover,
   // expression stays null and the state is flat.
   const handleAssetFileChange = async (kind, key, file, expression = null) => {
-    if (!file || !taskId) return;
+    // assetScopeId, not taskId: editing a published story whose draft row was
+    // cleaned up still needs somewhere stable to put the art.
+    if (!file || !assetScopeId) return;
 
     const previewUrl = URL.createObjectURL(file);
     const isCharWithExpr = kind === 'characters' && !!expression;
@@ -650,7 +1073,7 @@ export default function CreatorApp() {
       const safeKey = key.toLowerCase().replace(/[^a-z0-9]+/g, '_');
       const ext = file.name.split('.').pop();
       const suffix = isCharWithExpr ? `_${expression.toLowerCase().replace(/[^a-z0-9]+/g, '_')}` : '';
-      const path = `assets/${taskId}/${kind}/${safeKey}${suffix}.${ext}`;
+      const path = `assets/${assetScopeId}/${kind}/${safeKey}${suffix}_${Date.now()}.${ext}`;
       const { error: upErr } = await supabase.storage.from('visual-novels').upload(path, file, { upsert: true });
       if (upErr) throw upErr;
       const publicUrl = supabase.storage.from('visual-novels').getPublicUrl(path).data.publicUrl;
@@ -671,22 +1094,26 @@ export default function CreatorApp() {
       });
 
       // Persist to draft_assets on the task row (nested for characters,
-      // flat for backgrounds/cover — same as the state shape).
-      const { data: row } = await supabase.from('generation_tasks').select('draft_assets').eq('id', taskId).single();
-      const draft = row?.draft_assets || {};
-      if (isCharWithExpr) {
-        draft.characters = draft.characters || {};
-        // If a prior draft accidentally stored a flat string for this char
-        // (old-shape leftovers), promote it into the new nested object under
-        // "neutral" so we don't lose that upload when we merge in the new one.
-        if (typeof draft.characters[key] === 'string') {
-          draft.characters[key] = { neutral: draft.characters[key] };
+      // flat for backgrounds/cover — same as the state shape). Skipped when
+      // there's no draft row, e.g. editing a published story directly; in
+      // that case Re-publish is what commits the new asset map.
+      if (taskId) {
+        const { data: row } = await supabase.from('generation_tasks').select('draft_assets').eq('id', taskId).single();
+        const draft = row?.draft_assets || {};
+        if (isCharWithExpr) {
+          draft.characters = draft.characters || {};
+          // If a prior draft accidentally stored a flat string for this char
+          // (old-shape leftovers), promote it into the new nested object under
+          // "neutral" so we don't lose that upload when we merge in the new one.
+          if (typeof draft.characters[key] === 'string') {
+            draft.characters[key] = { neutral: draft.characters[key] };
+          }
+          draft.characters[key] = { ...(draft.characters[key] || {}), [expression]: publicUrl };
+        } else {
+          draft[kind] = { ...(draft[kind] || {}), [key]: publicUrl };
         }
-        draft.characters[key] = { ...(draft.characters[key] || {}), [expression]: publicUrl };
-      } else {
-        draft[kind] = { ...(draft[kind] || {}), [key]: publicUrl };
+        await supabase.from('generation_tasks').update({ draft_assets: draft }).eq('id', taskId);
       }
-      await supabase.from('generation_tasks').update({ draft_assets: draft }).eq('id', taskId);
     } catch (err) {
       console.error('Asset upload failed:', err);
       setLogs(prev => [...prev, `[Error] Failed to upload ${kind} "${key}"${isCharWithExpr ? '/' + expression : ''}: ${err.message}`]);
@@ -711,10 +1138,13 @@ export default function CreatorApp() {
     }
   };
 
-  // A simple flat row used for backgrounds and cover art. Characters get
+  //  // A simple flat row used for backgrounds and cover art. Characters get
   // their own richer component (CharacterAssetCard) below because they now
   // have per-expression upload slots.
-  const AssetRow = ({ id, description, preview, onFile }) => {
+  //
+  // Each row now offers Generate (AI) alongside Upload, using the same
+  // description text the Copy button hands to an external tool.
+  const AssetRow = ({ id, description, preview, onFile, onGenerate, isGenerating, canGenerate }) => {
     const [showModal, setShowModal] = useState(false);
     return (
       <>
@@ -723,20 +1153,33 @@ export default function CreatorApp() {
           onClick={() => setShowModal(true)}
         >
           <div className="w-14 h-14 rounded-xl bg-[#0B0B14] overflow-hidden flex-shrink-0 flex items-center justify-center border border-[#2D1B4E]">
-            {preview ? <img src={preview} className="w-full h-full object-cover" alt={id} /> : <ImageIcon className="w-5 h-5 text-[#4D3A7A]" />}
+            {isGenerating
+              ? <Loader2 className="w-5 h-5 text-[#A78BFA] animate-spin" />
+              : preview
+                ? <img src={preview} className="w-full h-full object-cover" alt={id} />
+                : <ImageIcon className="w-5 h-5 text-[#4D3A7A]" />}
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-white text-base font-bold truncate tracking-wide">{id}</p>
             <p className="text-[#8A7DAB] text-[13px] leading-snug line-clamp-2 mt-1">{description || 'No description generated.'}</p>
           </div>
-          <label
-            className="bg-transparent hover:bg-[#2D1B4E] border border-[#4D3A7A] hover:border-[#8B5CF6] text-white text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer flex-shrink-0 transition-colors shadow-sm flex items-center gap-2"
-            onClick={e => e.stopPropagation()}
-          >
-            <span className="hidden sm:inline">Upload</span>
-            <UploadCloudIcon className="w-3.5 h-3.5" />
-            <input type="file" accept="image/*" className="hidden" onChange={(e) => onFile(e.target.files?.[0])} />
-          </label>
+          <div className="flex items-center gap-2 flex-shrink-0" onClick={e => e.stopPropagation()}>
+            <button
+              type="button"
+              onClick={onGenerate}
+              disabled={!canGenerate || isGenerating || !description}
+              title={!canGenerate ? 'Add an image API key in Engine Config → Asset Art' : 'Generate this asset with AI'}
+              className="bg-[#2D1B4E] hover:bg-[#3B0764] disabled:opacity-40 disabled:cursor-not-allowed border border-[#8B5CF6]/40 text-[#C4B5FD] text-xs font-bold px-3 py-2.5 rounded-xl transition-colors flex items-center gap-2"
+            >
+              {isGenerating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+              <span className="hidden sm:inline">Generate</span>
+            </button>
+            <label className="bg-transparent hover:bg-[#2D1B4E] border border-[#4D3A7A] hover:border-[#8B5CF6] text-white text-xs font-bold px-3 py-2.5 rounded-xl cursor-pointer transition-colors shadow-sm flex items-center gap-2">
+              <span className="hidden sm:inline">Upload</span>
+              <UploadCloudIcon className="w-3.5 h-3.5" />
+              <input type="file" accept="image/*" className="hidden" onChange={(e) => onFile(e.target.files?.[0])} />
+            </label>
+          </div>
         </div>
 
         {showModal && (
@@ -749,10 +1192,20 @@ export default function CreatorApp() {
               <div className="bg-[#0B0B14] border border-[#1C1635] rounded-xl p-4 mb-6">
                  <p className="text-[#C4B5FD] text-[15px] leading-relaxed select-all">{description || 'No description generated.'}</p>
               </div>
-              <label className="w-full bg-[#8B5CF6] hover:bg-[#7C3AED] text-white font-bold py-3.5 rounded-xl cursor-pointer transition-colors flex items-center justify-center gap-2">
-                <UploadCloudIcon className="w-4 h-4" /> Upload Art
-                <input type="file" accept="image/*" className="hidden" onChange={(e) => { onFile(e.target.files?.[0]); setShowModal(false); }} />
-              </label>
+              <div className="flex flex-col gap-3">
+                <button
+                  type="button"
+                  onClick={() => { onGenerate(); setShowModal(false); }}
+                  disabled={!canGenerate || isGenerating || !description}
+                  className="w-full bg-[#8B5CF6] hover:bg-[#7C3AED] disabled:bg-[#2D1B4E] disabled:text-[#8A7DAB] disabled:cursor-not-allowed text-white font-bold py-3.5 rounded-xl transition-colors flex items-center justify-center gap-2"
+                >
+                  <Sparkles className="w-4 h-4" /> Generate with AI
+                </button>
+                <label className="w-full bg-transparent border border-[#4D3A7A] hover:border-[#8B5CF6] hover:bg-[#1C1635] text-white font-bold py-3.5 rounded-xl cursor-pointer transition-colors flex items-center justify-center gap-2">
+                  <UploadCloudIcon className="w-4 h-4" /> Upload Art
+                  <input type="file" accept="image/*" className="hidden" onChange={(e) => { onFile(e.target.files?.[0]); setShowModal(false); }} />
+                </label>
+              </div>
             </div>
           </div>
         )}
@@ -760,23 +1213,28 @@ export default function CreatorApp() {
     );
   };
 
-  // Per-character asset card: one row per character, with a grid of upload
-  // slots — one slot per expression the story actually uses for them. The
-  // character's shared base description is shown once at the top; each
-  // expression tile shows its own short "note" underneath its filename tag,
-  // and carries a small copy button that copies a ready-to-paste art prompt
-  // (base description + expression note) to the clipboard.
-  const CharacterAssetCard = ({ character, uploadedByExpr, onUpload, onCopyPrompt, copiedKey }) => {
+
+  //   // Per-character asset card: one row per character, with a grid of slots —
+  // one slot per expression the story actually uses. The character's shared
+  // base description shows once at the top; each expression tile carries TWO
+  // small buttons: copy the art prompt for an external tool, or generate it
+  // right here on the Asset Art key.
+  const CharacterAssetCard = ({
+    character, uploadedByExpr, onUpload, onCopyPrompt, copiedKey,
+    onGenerate, generatingKey, canGenerate,
+  }) => {
     const expressions = character.expressions?.length
       ? character.expressions
       : [{ id: 'neutral', note: '' }];
+
+    const baseDescription = character.base_description || character.description || '';
 
     return (
       <div className="bg-[#1C1635] border border-[#2D1B4E] rounded-2xl p-4">
         <div className="mb-4">
           <p className="text-white font-bold text-base tracking-wide">{character.name}</p>
           <p className="text-[#8A7DAB] text-[13px] leading-snug mt-1">
-            {character.base_description || character.description || 'No description generated.'}
+            {baseDescription || 'No description generated.'}
           </p>
         </div>
         <div className="grid grid-cols-3 gap-2">
@@ -785,13 +1243,18 @@ export default function CreatorApp() {
             const preview = entry?.previewUrl || entry?.uploadedUrl;
             const tileKey = `${character.name}__${expr.id}`;
             const justCopied = copiedKey === tileKey;
+            const isGenerating = generatingKey === tileKey;
             return (
               <div key={expr.id} className="relative">
                 <label
                   className="relative aspect-square bg-[#0B0B14] border border-[#2D1B4E] rounded-lg overflow-hidden cursor-pointer hover:border-[#8B5CF6]/60 transition-colors group block"
                   title={expr.note || expr.id}
                 >
-                  {preview ? (
+                  {isGenerating ? (
+                    <div className="w-full h-full flex items-center justify-center bg-[#120F24]">
+                      <Loader2 className="w-5 h-5 text-[#A78BFA] animate-spin" />
+                    </div>
+                  ) : preview ? (
                     <img src={preview} alt={`${character.name} - ${expr.id}`} className="w-full h-full object-cover" />
                   ) : (
                     <div className="w-full h-full flex flex-col items-center justify-center gap-1 px-2 text-center">
@@ -811,16 +1274,39 @@ export default function CreatorApp() {
                     onChange={(e) => onUpload(expr.id, e.target.files?.[0])}
                   />
                 </label>
-                <button
-                  type="button"
-                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); onCopyPrompt(character, expr); }}
-                  title="Copy art prompt for this expression"
-                  className={`absolute top-1 right-1 w-5 h-5 rounded-full flex items-center justify-center transition-colors z-10 ${
-                    justCopied ? 'bg-[#10B981] text-white' : 'bg-black/70 text-[#C4B5FD] hover:bg-[#8B5CF6] hover:text-white'
-                  }`}
-                >
-                  {justCopied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                </button>
+
+                <div className="absolute top-1 right-1 flex items-center gap-1 z-10">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault(); e.stopPropagation();
+                      onGenerate(character, expr);
+                    }}
+                    disabled={!canGenerate || isGenerating || !baseDescription}
+                    title={
+                      !canGenerate ? 'Add an image API key in Engine Config → Asset Art'
+                        : !baseDescription ? 'No description to draw from'
+                        : 'Generate this portrait with AI'
+                    }
+                    className={`w-5 h-5 rounded-full flex items-center justify-center transition-colors ${
+                      !canGenerate || !baseDescription
+                        ? 'bg-black/50 text-[#4D3A7A] cursor-not-allowed'
+                        : 'bg-black/70 text-[#C4B5FD] hover:bg-[#8B5CF6] hover:text-white'
+                    }`}
+                  >
+                    {isGenerating ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); onCopyPrompt(character, expr); }}
+                    title="Copy art prompt for this expression"
+                    className={`w-5 h-5 rounded-full flex items-center justify-center transition-colors ${
+                      justCopied ? 'bg-[#10B981] text-white' : 'bg-black/70 text-[#C4B5FD] hover:bg-[#8B5CF6] hover:text-white'
+                    }`}
+                  >
+                    {justCopied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                  </button>
+                </div>
               </div>
             );
           })}
@@ -828,6 +1314,8 @@ export default function CreatorApp() {
       </div>
     );
   };
+
+
 
   const UploadCloudIcon = ({className}) => (
      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={className}>
@@ -896,139 +1384,328 @@ export default function CreatorApp() {
 
   // --- Screens ---
 
-  const renderHome = () => (
-    <div className="flex flex-col h-full bg-[#0B0B14]">
-      <div className="flex-1 overflow-y-auto px-8 pt-14 pb-6 flex flex-col items-center">
-        <div className="w-21 h-21 mb-4 flex items-center justify-center">
-          <img src={vystoriaLogo} alt="Vystoria Org Logo" className="w-full h-full object-contain" />
-        </div>
-        <h1 className="text-4xl font-bold font-sans tracking-wide text-white mb-1">Vystoria</h1>
-        <p className="text-lg text-purple-300 font-sans tracking-wide mb-4">Story Engine</p>
+  const renderHome = () => {
+    const estimated = estimateCalls(targetLength, judgeMode);
+    const dailyHint = PROVIDER_DAILY_HINT[provider];
+    const overBudget = dailyHint != null && estimated > dailyHint;
 
-        <div className="flex items-center gap-2.5 bg-[#120F24] border border-[#2D1B4E] rounded-full px-4 py-2 mb-4 shadow-inner">
-          <span className={`w-2.5 h-2.5 rounded-full ${status.dot}`}></span>
-          <span className={`text-xs font-bold uppercase tracking-wider ${status.text}`}>{status.label}</span>
-        </div>
-
-        {taskStatus === 'failed' && (
-          <p className="text-[#FCA5A5] text-[12px] font-semibold text-center max-w-xs leading-relaxed mb-6 px-2">
-            Last attempt failed — see the Generation Console for details. Engine Config is unlocked, so fix it and hit Initialize Pipeline again.
-          </p>
-        )}
-
-        <div className="w-full space-y-4 max-w-md mx-auto">
-          <NavPill
-            icon={Cpu}
-            label="Engine Config"
-            description={`${provider}${modelName.trim() ? ' · ' + modelName.trim().split('-')[0] : ' · auto-selected model'}`}
-            onClick={() => setCurrentView('engine_config')}
-            disabled={configLocked}
-            disabledLabel="Locked after start"
-          />
-          <NavPill
-            icon={BookOpen}
-            label="Novel Parameters"
-            description={title ? `${title}` : 'Untitled draft'}
-            onClick={() => setCurrentView('novel_parameters')}
-            disabled={configLocked}
-            disabledLabel="Locked after start"
-          />
-          <NavPill
-            icon={Terminal}
-            label="Generation Console"
-            description={status.label}
-            onClick={() => setCurrentView('console')}
-            trailing={<span className={`w-3 h-3 rounded-full ${status.dot} mr-2`} />}
-          />
-          <NavPill
-            icon={Scale}
-            label="AI Judgement"
-            description="Quality scorecard"
-            onClick={() => setCurrentView('judgement')}
-            disabled={!resultJson}
-          />
-          <NavPill
-            icon={ImageIcon}
-            label="Story Assets"
-            description="Art, play-test & save"
-            onClick={() => setCurrentView('assets')}
-            disabled={!resultJson}
-          />
-          <NavPill
-            icon={FileText}
-            label="Story Library"
-            description={myStories.length ? `${myStories.length} saved` : 'Browse past drafts'}
-            onClick={() => { fetchMyStories(); setCurrentView('library'); }}
-          />
-        </div>
-      </div>
-
-      <div className="px-6 pb-8 pt-4 bg-gradient-to-t from-[#0B0B14] via-[#0B0B14] to-transparent flex-shrink-0 z-10 max-w-md mx-auto w-full">
-        <button
-          onClick={() => { handleGenerate(); setCurrentView('console'); }}
-          disabled={isSubmitting || generationStarted}
-          className="w-full bg-gradient-to-r from-[#9333EA] to-[#7C3AED] hover:from-[#A855F7] hover:to-[#8B5CF6] disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold py-[18px] text-[17px] rounded-full shadow-[0_0_30px_rgba(139,92,246,0.4)] transition-all flex items-center justify-center gap-3 transform hover:scale-[1.02] active:scale-[0.98]"
-        >
-          {['pending', 'generating'].includes(taskStatus) ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
-          {['pending', 'generating'].includes(taskStatus) ? 'Engine Running...' : generationStarted ? 'Pipeline Already Run' : 'Initialize Pipeline'}
-        </button>
-
-        {(hasCompletedPlaythrough && draftSaved) || taskStatus === 'failed' ? (
-          <button
-            onClick={resetAll}
-            className="w-full mt-3 bg-transparent border border-[#3B0764] hover:bg-[#1C1635] text-[#A78BFA] font-bold py-4 rounded-full text-[15px] transition-all flex items-center justify-center gap-2"
-          >
-            <RotateCcw className="w-4 h-4" /> {taskStatus === 'failed' ? 'Start Completely Fresh' : 'Start New Story'}
-          </button>
-        ) : null}
-      </div>
-    </div>
-  );
-
-  const renderEngineConfig = () => (
-    <div className="flex flex-col h-full bg-[#0B0B14]">
-      <div className="flex-1 overflow-y-auto px-6 pt-12 pb-6 max-w-md mx-auto w-full">
-        <ScreenHeader title="Engine Config" subtitleText="Paste any provider's API key — the engine works with whatever model that key currently has access to." />
-        <div className="space-y-6 mt-8">
-          <div>
-            <FieldLabel>Provider</FieldLabel>
-            <select value={provider} onChange={handleProviderChange} className={fieldClasses}>
-              <option value="gemini">Google Gemini</option>
-              <option value="openai">OpenAI (ChatGPT)</option>
-              <option value="claude">Anthropic Claude</option>
-              <option value="grok">xAI Grok</option>
-            </select>
+    return (
+      <div className="flex flex-col h-full bg-[#0B0B14]">
+        <div className="flex-1 overflow-y-auto px-8 pt-14 pb-6 flex flex-col items-center">
+          <div className="w-21 h-21 mb-4 flex items-center justify-center">
+            <img src={vystoriaLogo} alt="Vystoria Org Logo" className="w-full h-full object-contain" />
           </div>
-          <div>
-            <FieldLabel>
-              Model Name <span className="text-[#8A7DAB] normal-case tracking-normal text-xs ml-1">(optional)</span>
-            </FieldLabel>
-            <input
-              type="text"
-              value={modelName}
-              onChange={(e) => setModelName(e.target.value)}
-              placeholder={MODEL_PLACEHOLDERS[provider] || 'Leave blank for the recommended default'}
-              className={fieldClasses}
+          <h1 className="text-4xl font-bold font-sans tracking-wide text-white mb-1">Vystoria</h1>
+          <p className="text-lg text-purple-300 font-sans tracking-wide mb-4">Story Engine</p>
+
+          <div className="flex items-center gap-2.5 bg-[#120F24] border border-[#2D1B4E] rounded-full px-4 py-2 mb-4 shadow-inner">
+            <span className={`w-2.5 h-2.5 rounded-full ${status.dot}`}></span>
+            <span className={`text-xs font-bold uppercase tracking-wider ${status.text}`}>{status.label}</span>
+          </div>
+
+          {/* Pre-flight cost. The whole reason runs kept dying at 429 was that
+              nothing ever said what a run costs against a 20/day allowance. */}
+          {!generationStarted && (
+            <div className={`w-full max-w-md mb-5 rounded-2xl p-4 border text-[12px] leading-relaxed ${
+              overBudget
+                ? 'bg-[#422006]/30 border-[#EAB308]/40 text-[#FDE047]'
+                : 'bg-[#120F24] border-[#2D1B4E] text-[#8A7DAB]'
+            }`}>
+              <div className="flex items-center gap-2 mb-1">
+                {overBudget ? <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" /> : <Cpu className="w-3.5 h-3.5 flex-shrink-0" />}
+                <span className="font-bold uppercase tracking-widest text-[11px]">
+                  Estimated cost: ~{estimated} model calls
+                </span>
+              </div>
+              {overBudget ? (
+                <span>
+                  {PROVIDER_LABELS[provider]}'s free tier allows about {dailyHint} requests/day — this run
+                  won't fit. Drop to fewer chapters, set Judge to Off, or use a paid key.
+                </span>
+              ) : (
+                <span>
+                  {targetLength} · judge: {judgeMode} · {scenesPerChapter} scenes/chapter.
+                  {dailyHint != null && ` Free-tier ceiling is about ${dailyHint} requests/day.`}
+                </span>
+              )}
+            </div>
+          )}
+
+          {taskStatus === 'failed' && (
+            <div className="w-full max-w-md mb-5 bg-[#3B0764]/20 border border-[#EF4444]/40 rounded-2xl p-4">
+              <p className="text-[#FCA5A5] text-[12px] font-semibold leading-relaxed mb-3">
+                {failureKind === 'quota'
+                  ? 'Paused: the provider cut this key off. Nothing is lost — everything written so far is checkpointed.'
+                  : failureKind === 'model'
+                    ? 'The provider rejected that model name. Open Engine Config and change it.'
+                    : 'Last attempt failed — see the Generation Console for details. Engine Config is unlocked.'}
+              </p>
+              {canResume && (
+                <>
+                  <p className="text-[#C4B5FD] text-[11px] leading-relaxed mb-3">
+                    Checkpoint holds {checkpointProgress?.chapters_done ?? 0}/{checkpointProgress?.num_chapters ?? '?'} chapters
+                    {checkpointProgress?.scenes_banked ? ` (${checkpointProgress.scenes_banked} scenes)` : ''}.
+                    Resuming only pays for what's left.
+                  </p>
+                  <button
+                    onClick={handleResumeGeneration}
+                    disabled={isResuming || !apiKey}
+                    className="w-full bg-gradient-to-r from-[#9333EA] to-[#7C3AED] hover:from-[#A855F7] hover:to-[#8B5CF6] disabled:opacity-50 text-white font-bold py-3 rounded-xl text-[14px] transition-all flex items-center justify-center gap-2"
+                  >
+                    {isResuming ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}
+                    {isResuming ? 'Resuming...' : 'Resume From Checkpoint'}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          <div className="w-full space-y-4 max-w-md mx-auto">
+            <NavPill
+              icon={Cpu}
+              label="Engine Config"
+              description={`${provider}${modelName.trim() ? ' · ' + modelName.trim().split('-')[0] : ' · auto-selected model'} · judge: ${judgeMode}`}
+              onClick={() => setCurrentView('engine_config')}
+              disabled={configLocked}
+              disabledLabel="Locked after start"
             />
-            <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">
-              Leave this blank and the engine will use its current recommended model for {PROVIDER_LABELS[provider] || 'this provider'}.
-              Or paste any model ID your key has access to — old or new, it doesn't matter which provider. If a run ever fails because a
-              model was retired or renamed, come back here, clear or change this field, and hit Initialize Pipeline again — nothing else
-              needs to change.
-            </p>
+            <NavPill
+              icon={BookOpen}
+              label="Novel Parameters"
+              description={title ? `${title}` : 'Untitled draft'}
+              onClick={() => setCurrentView('novel_parameters')}
+              disabled={configLocked}
+              disabledLabel="Locked after start"
+            />
+            <NavPill
+              icon={Terminal}
+              label="Generation Console"
+              description={status.label}
+              onClick={() => setCurrentView('console')}
+              trailing={<span className={`w-3 h-3 rounded-full ${status.dot} mr-2`} />}
+            />
+            <NavPill
+              icon={Scale}
+              label="AI Judgement"
+              description="Quality scorecard"
+              onClick={() => setCurrentView('judgement')}
+              disabled={!resultJson}
+            />
+            <NavPill
+              icon={ImageIcon}
+              label="Story Assets"
+              description={editingStoryId ? 'Editing a published story' : 'Art, play-test & save'}
+              onClick={() => setCurrentView('assets')}
+              disabled={!resultJson}
+            />
+            <NavPill
+              icon={FileText}
+              label="Story Library"
+              description="Studio drafts & the live catalog"
+              onClick={() => openLibrary('drafts')}
+            />
           </div>
-          <div>
-            <FieldLabel><span className="flex items-center gap-2"><Key className="w-4 h-4" /> Secret API Key</span></FieldLabel>
-            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={`Enter ${provider} API Key`} className={fieldClasses} />
-            <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">Stored only in this session — never written to the story catalog.</p>
-          </div>
+
+          <button
+            onClick={onSignOut}
+            className="mt-6 text-[#4D3A7A] hover:text-[#8A7DAB] text-[11px] font-bold uppercase tracking-widest flex items-center gap-2 transition-colors"
+          >
+            <LogOut className="w-3 h-3" /> {session?.user?.email || 'Sign out'}
+          </button>
+        </div>
+
+        <div className="px-6 pb-8 pt-4 bg-gradient-to-t from-[#0B0B14] via-[#0B0B14] to-transparent flex-shrink-0 z-10 max-w-md mx-auto w-full">
+          <button
+            onClick={() => { handleGenerate(); setCurrentView('console'); }}
+            disabled={isSubmitting || generationStarted}
+            className="w-full bg-gradient-to-r from-[#9333EA] to-[#7C3AED] hover:from-[#A855F7] hover:to-[#8B5CF6] disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold py-[18px] text-[17px] rounded-full shadow-[0_0_30px_rgba(139,92,246,0.4)] transition-all flex items-center justify-center gap-3 transform hover:scale-[1.02] active:scale-[0.98]"
+          >
+            {['pending', 'generating'].includes(taskStatus) ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
+            {['pending', 'generating'].includes(taskStatus) ? 'Engine Running...' : generationStarted ? 'Pipeline Already Run' : 'Initialize Pipeline'}
+          </button>
+
+          {(hasCompletedPlaythrough && draftSaved) || taskStatus === 'failed' ? (
+            <button
+              onClick={resetAll}
+              className="w-full mt-3 bg-transparent border border-[#3B0764] hover:bg-[#1C1635] text-[#A78BFA] font-bold py-4 rounded-full text-[15px] transition-all flex items-center justify-center gap-2"
+            >
+              <RotateCcw className="w-4 h-4" /> {taskStatus === 'failed' ? 'Discard & Start Fresh' : 'Start New Story'}
+            </button>
+          ) : null}
         </div>
       </div>
-      <div className="px-6 pb-8 pt-4 flex-shrink-0 max-w-md mx-auto w-full">
-        <button onClick={() => setCurrentView('home')} className="w-full bg-[#1C1635] hover:bg-[#2D1B4E] border border-[#3B0764] text-white font-bold py-[18px] text-[17px] rounded-full shadow-lg transition-all">Done</button>
+    );
+  };
+
+
+
+  const renderEngineConfig = () => {
+    const activeJudge = JUDGE_MODES.find(m => m.value === judgeMode) || JUDGE_MODES[0];
+    return (
+      <div className="flex flex-col h-full bg-[#0B0B14]">
+        <div className="flex-1 overflow-y-auto px-6 pt-12 pb-6 max-w-md mx-auto w-full">
+          <ScreenHeader title="Engine Config" subtitleText="Paste any provider's API key — the engine works with whatever model that key currently has access to." />
+
+          <div className="space-y-6 mt-8">
+            <div>
+              <FieldLabel>Provider</FieldLabel>
+              <select value={provider} onChange={handleProviderChange} className={fieldClasses}>
+                <option value="gemini">Google Gemini</option>
+                <option value="openai">OpenAI (ChatGPT)</option>
+                <option value="claude">Anthropic Claude</option>
+                <option value="grok">xAI Grok</option>
+              </select>
+            </div>
+
+            <div>
+              <FieldLabel>
+                Model Name <span className="text-[#8A7DAB] normal-case tracking-normal text-xs ml-1">(optional)</span>
+              </FieldLabel>
+              <input
+                type="text"
+                value={modelName}
+                onChange={(e) => setModelName(e.target.value)}
+                placeholder={MODEL_PLACEHOLDERS[provider] || 'Leave blank for the recommended default'}
+                className={fieldClasses}
+              />
+              <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">
+                Leave this blank and the engine will use its current recommended model for {PROVIDER_LABELS[provider] || 'this provider'}.
+                Or paste any model ID your key has access to.
+              </p>
+            </div>
+
+            <div>
+              <FieldLabel><span className="flex items-center gap-2"><Key className="w-4 h-4" /> Secret API Key</span></FieldLabel>
+              <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={`Enter ${provider} API Key`} className={fieldClasses} />
+              <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">Stored only in this session — never written to the story catalog.</p>
+            </div>
+
+            {/* ---------- QUOTA CONTROLS ---------- */}
+            <div className="pt-2">
+              <div className="inline-flex items-center gap-2 bg-[#1C1635] px-4 py-2 rounded-full mb-4">
+                <h4 className="text-[#A78BFA] font-bold text-xs tracking-widest uppercase">Quota Controls</h4>
+              </div>
+              <p className="text-[11px] text-[#4D3A7A] italic mb-5 pl-1 leading-relaxed">
+                A run costs roughly <span className="text-[#8A7DAB] not-italic font-bold">chapters + 4</span> model
+                calls. Gemini's free tier allows about 20 requests per day, so an 8-chapter book with a
+                strict judge cannot fit in one day on a free key.
+              </p>
+
+              <div className="space-y-6">
+                <div>
+                  <FieldLabel>AI Quality Judge</FieldLabel>
+                  <select value={judgeMode} onChange={(e) => setJudgeMode(e.target.value)} className={fieldClasses}>
+                    {JUDGE_MODES.map(m => (
+                      <option key={m.value} value={m.value}>{m.label} — {m.cost}</option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">{activeJudge.blurb}</p>
+                </div>
+
+                <div>
+                  <FieldLabel>Scenes Per Chapter</FieldLabel>
+                  <select value={scenesPerChapter} onChange={(e) => setScenesPerChapter(Number(e.target.value))} className={fieldClasses}>
+                    <option value={10}>10 — tight, most reliable</option>
+                    <option value={14}>14 — balanced (recommended)</option>
+                    <option value={18}>18 — long chapters</option>
+                    <option value={24}>24 — very long (may overrun output limits)</option>
+                  </select>
+                  <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">
+                    Long chapters overrun the model's output-token ceiling and come back as truncated JSON,
+                    which costs a retry — and every retry is a request off your daily allowance.
+                  </p>
+                </div>
+
+                <div>
+                  <FieldLabel>
+                    Max Model Calls <span className="text-[#8A7DAB] normal-case tracking-normal text-xs ml-1">(0 = no limit)</span>
+                  </FieldLabel>
+                  <input
+                    type="number"
+                    min={0}
+                    value={maxLlmCalls}
+                    onChange={(e) => setMaxLlmCalls(e.target.value)}
+                    placeholder="e.g. 16"
+                    className={fieldClasses}
+                  />
+                  <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">
+                    A hard stop, checked before every call. Set it a little under your daily allowance
+                    (e.g. 16 against Gemini's 20) and you'll get a clean, checkpointed pause from Vystoria
+                    instead of a raw 429 from the vendor.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* ---------- ASSET ART ---------- */}
+            <div className="pt-2">
+              <div className="inline-flex items-center gap-2 bg-[#1C1635] px-4 py-2 rounded-full mb-4">
+                <Palette className="w-3.5 h-3.5 text-[#A78BFA]" />
+                <h4 className="text-[#A78BFA] font-bold text-xs tracking-widest uppercase">Asset Art</h4>
+              </div>
+              <p className="text-[11px] text-[#4D3A7A] italic mb-5 pl-1 leading-relaxed">
+                A separate provider and key, on purpose: write the story on one account, draw forty
+                portraits on another, and neither eats the other's daily allowance.
+              </p>
+
+              <div className="space-y-6">
+                <div>
+                  <FieldLabel>Image Provider</FieldLabel>
+                  <select value={imageProvider} onChange={(e) => { setImageProvider(e.target.value); setImageModel(''); }} className={fieldClasses}>
+                    <option value="gemini">Google Gemini (images)</option>
+                    <option value="openai">OpenAI (images)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <FieldLabel>
+                    Image Model <span className="text-[#8A7DAB] normal-case tracking-normal text-xs ml-1">(optional)</span>
+                  </FieldLabel>
+                  <input
+                    type="text"
+                    value={imageModel}
+                    onChange={(e) => setImageModel(e.target.value)}
+                    placeholder={IMAGE_MODEL_PLACEHOLDERS[imageProvider]}
+                    className={fieldClasses}
+                  />
+                </div>
+
+                <div>
+                  <FieldLabel><span className="flex items-center gap-2"><Key className="w-4 h-4" /> Image API Key</span></FieldLabel>
+                  <input
+                    type="password"
+                    value={imageApiKey}
+                    onChange={(e) => setImageApiKey(e.target.value)}
+                    placeholder={`Enter ${IMAGE_PROVIDER_LABELS[imageProvider] || 'image'} key`}
+                    className={fieldClasses}
+                  />
+                </div>
+
+                <div>
+                  <FieldLabel>House Art Style</FieldLabel>
+                  <textarea
+                    value={artStyle}
+                    onChange={(e) => setArtStyle(e.target.value)}
+                    rows={3}
+                    placeholder="e.g. Moody painterly anime key art, cool desaturated palette, dramatic rim lighting"
+                    className={`${fieldClasses} resize-none`}
+                  />
+                  <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">
+                    Prepended to every generated asset so thirty portraits and fifteen backgrounds come
+                    back looking like one game rather than thirty-five unrelated images.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="px-6 pb-8 pt-4 flex-shrink-0 max-w-md mx-auto w-full">
+          <button onClick={() => setCurrentView('home')} className="w-full bg-[#1C1635] hover:bg-[#2D1B4E] border border-[#3B0764] text-white font-bold py-[18px] text-[17px] rounded-full shadow-lg transition-all">Done</button>
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   const renderNovelParameters = () => (
     <div className="flex flex-col h-full bg-[#0B0B14]">
@@ -1113,10 +1790,18 @@ export default function CreatorApp() {
               <Scale className="w-5 h-5 text-[#A78BFA]" />
             </div>
             <div className="flex-1">
-              <span className="text-[15px] font-bold text-white block mb-1">AI Quality Judge — always on</span>
+              <span className="text-[15px] font-bold text-white block mb-1">
+                AI Quality Judge — {judgeMode}
+              </span>
               <span className="text-[13px] text-[#8A7DAB] block leading-relaxed">
-                Every draft is automatically reviewed after generation. If it fails the judge, the engine regenerates the whole
-                story once from the same World Bible before handing it back to you.
+                {judgeMode === 'strict'
+                  ? 'A FAIL throws every chapter away and rewrites the book once. That roughly doubles the cost of the run — switch to Advisory in Engine Config if you are on a free key.'
+                  : judgeMode === 'off'
+                    ? 'Skipped during generation. You can still score the finished draft by hand from the AI Judgement screen.'
+                    : 'Scores the draft once and records the scorecard. It never triggers a rewrite — fix specific problems with Tweak Scene, which costs one call instead of a whole book.'}
+              </span>
+              <span className="text-[12px] text-[#4D3A7A] block mt-2">
+                This run: ~{estimateCalls(targetLength, judgeMode)} model calls.
               </span>
             </div>
           </div>
@@ -1207,24 +1892,139 @@ export default function CreatorApp() {
   const renderLibrary = () => (
     <div className="flex flex-col h-full bg-[#0B0B14]">
       <div className="flex-1 overflow-y-auto px-6 pt-12 pb-6 max-w-md mx-auto w-full">
-        <ScreenHeader title="Story Library" subtitleText="Resume a draft or review a published story." />
+        <ScreenHeader
+          title="Story Library"
+          subtitleText="Everything the studio has made — on every device."
+          right={
+            <button
+              onClick={() => (libraryTab === 'drafts' ? fetchMyStories() : fetchPublishedStories())}
+              className="w-12 h-12 bg-transparent border border-[#2D1B4E] rounded-full flex items-center justify-center hover:bg-[#1C1635] transition flex-shrink-0"
+              title="Refresh"
+            >
+              <RefreshCw className="w-5 h-5 text-[#A78BFA]" />
+            </button>
+          }
+        />
+
+        {/* Tabs */}
+        <div className="flex gap-2 bg-[#120F24] border border-[#2D1B4E] rounded-2xl p-1.5 mb-6">
+          {[
+            { key: 'drafts', label: 'Drafts', icon: FileText },
+            { key: 'published', label: 'Published', icon: Globe },
+          ].map(tab => (
+            <button
+              key={tab.key}
+              onClick={() => { setLibraryTab(tab.key); tab.key === 'drafts' ? fetchMyStories() : fetchPublishedStories(); }}
+              className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-[13px] font-bold transition-all ${
+                libraryTab === tab.key
+                  ? 'bg-[#2D1B4E] text-white shadow-inner'
+                  : 'bg-transparent text-[#8A7DAB] hover:text-[#C4B5FD]'
+              }`}
+            >
+              <tab.icon className="w-4 h-4" /> {tab.label}
+            </button>
+          ))}
+        </div>
+
         {isLoadingLibrary ? (
           <div className="text-center py-20"><Loader2 className="w-6 h-6 animate-spin mx-auto text-[#8B5CF6]" /></div>
-        ) : myStories.length === 0 ? (
-          <div className="text-center text-[#4D3A7A] text-[15px] py-20 italic">No stories generated yet.</div>
+        ) : libraryTab === 'drafts' ? (
+          myStories.length === 0 ? (
+            <div className="text-center text-[#4D3A7A] text-[15px] py-20 italic">No drafts in the studio yet.</div>
+          ) : (
+            <div className="space-y-3">
+              {myStories.map(t => {
+                const mine = t.creator_id === session?.user?.id;
+                const resumable = t.status === 'failed' && (t.checkpoint_progress?.chapters_done ?? 0) > 0;
+                return (
+                  <button
+                    key={t.id}
+                    onClick={() => resumeTask(t)}
+                    className="w-full text-left bg-[#1C1635] border border-[#2D1B4E] rounded-2xl p-4 hover:border-[#8B5CF6]/50 transition-all"
+                  >
+                    <div className="flex items-center justify-between mb-1 gap-2">
+                      <span className="text-white font-bold truncate">{t.title || 'Untitled'}</span>
+                      <span className={`text-[10px] font-bold uppercase px-2 py-1 rounded-full flex-shrink-0 ${
+                        t.published_story_id ? 'bg-[#10B981]/20 text-[#34D399]'
+                          : t.status === 'failed' ? 'bg-[#EF4444]/20 text-[#FCA5A5]'
+                          : 'bg-[#2D1B4E] text-[#A78BFA]'
+                      }`}>
+                        {t.published_story_id ? 'Published' : t.status}
+                      </span>
+                    </div>
+                    <p className="text-[#8A7DAB] text-xs truncate">
+                      {t.provider} · {t.current_step || '—'} · {t.progress_percent ?? 0}%
+                    </p>
+                    <div className="flex items-center gap-2 mt-2 flex-wrap">
+                      {!mine && (
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-[#4D3A7A] bg-[#0B0B14] px-2 py-1 rounded-full">
+                          Teammate's
+                        </span>
+                      )}
+                      {resumable && (
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-[#FDE047] bg-[#422006]/40 px-2 py-1 rounded-full">
+                          Resumable · {t.checkpoint_progress.chapters_done}/{t.checkpoint_progress.num_chapters} ch
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )
+        ) : publishedStories.length === 0 ? (
+          <div className="text-center text-[#4D3A7A] text-[15px] py-20 italic">Nothing published yet.</div>
         ) : (
           <div className="space-y-3">
-            {myStories.map(t => (
-              <button key={t.id} onClick={() => resumeTask(t)} className="w-full text-left bg-[#1C1635] border border-[#2D1B4E] rounded-2xl p-4 hover:border-[#8B5CF6]/50 transition-all">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-white font-bold truncate">{t.title || 'Untitled'}</span>
-                  <span className={`text-[10px] font-bold uppercase px-2 py-1 rounded-full flex-shrink-0 ml-2 ${t.published_story_id ? 'bg-[#10B981]/20 text-[#34D399]' : 'bg-[#2D1B4E] text-[#A78BFA]'}`}>
-                    {t.published_story_id ? 'Published' : t.status}
-                  </span>
+            {publishedStories.map(s => (
+              <div key={s.id} className="bg-[#1C1635] border border-[#2D1B4E] rounded-2xl p-4">
+                <div className="flex items-start gap-3">
+                  <div className="w-14 h-20 rounded-xl bg-[#0B0B14] overflow-hidden flex-shrink-0 flex items-center justify-center border border-[#2D1B4E]">
+                    {s.cover_image
+                      ? <img src={s.cover_image} alt={s.title} className="w-full h-full object-cover" />
+                      : <ImageIcon className="w-5 h-5 text-[#4D3A7A]" />}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      {s.is_featured && <Star className="w-3.5 h-3.5 text-[#FDE047] fill-[#FDE047] flex-shrink-0" />}
+                      <span className="text-white font-bold truncate">{s.title || 'Untitled'}</span>
+                    </div>
+                    <p className="text-[#8A7DAB] text-xs truncate">{s.genre || 'Uncategorized'}</p>
+                    <p className="text-[#4D3A7A] text-[11px] mt-1">
+                      Updated {new Date(s.updated_at || s.created_at).toLocaleDateString()}
+                    </p>
+                  </div>
                 </div>
-                <p className="text-[#8A7DAB] text-xs">{t.provider} · {t.current_step || '—'} · {t.progress_percent ?? 0}%</p>
-              </button>
+
+                <div className="flex gap-2 mt-4">
+                  <button
+                    onClick={() => openPublishedStory(s)}
+                    className="flex-1 bg-[#2D1B4E] hover:bg-[#3B0764] border border-[#4D3A7A] text-white text-[13px] font-bold py-3 rounded-xl transition-colors flex items-center justify-center gap-2"
+                  >
+                    <Wand2 className="w-4 h-4" /> Edit
+                  </button>
+                  <button
+                    onClick={() => handleSetFeatured(s.id, !s.is_featured)}
+                    disabled={featuringId === s.id}
+                    title={s.is_featured ? 'Remove from the home page hero' : 'Make this the home page hero'}
+                    className={`flex-1 text-[13px] font-bold py-3 rounded-xl transition-colors flex items-center justify-center gap-2 border disabled:opacity-50 ${
+                      s.is_featured
+                        ? 'bg-[#FDE047]/15 border-[#EAB308]/50 text-[#FDE047] hover:bg-[#FDE047]/25'
+                        : 'bg-transparent border-[#4D3A7A] text-[#8A7DAB] hover:border-[#EAB308]/60 hover:text-[#FDE047]'
+                    }`}
+                  >
+                    {featuringId === s.id
+                      ? <Loader2 className="w-4 h-4 animate-spin" />
+                      : <Star className={`w-4 h-4 ${s.is_featured ? 'fill-[#FDE047]' : ''}`} />}
+                    {s.is_featured ? 'Featured' : 'Feature'}
+                  </button>
+                </div>
+              </div>
             ))}
+            <p className="text-[11px] text-[#4D3A7A] italic leading-relaxed pt-2 pl-1">
+              Only one story can be featured at a time — featuring a new one automatically un-features
+              the current hero.
+            </p>
           </div>
         )}
       </div>
@@ -1258,17 +2058,48 @@ export default function CreatorApp() {
           <div className="text-center text-[#4D3A7A] text-[15px] py-20 italic">Generate a story first.</div>
         ) : (
           <div className="space-y-8">
-            {draftSaved && (
+            {editingStoryId && (
+              <div className="bg-[#2D1B4E]/40 border border-[#8B5CF6]/40 rounded-2xl p-5 text-[#C4B5FD] text-[13px] leading-relaxed flex items-start gap-3">
+                <Globe className="w-4 h-4 text-[#A78BFA] flex-shrink-0 mt-0.5" />
+                <span>
+                  <span className="text-white font-bold block mb-1">Editing a live story.</span>
+                  Swap assets here, or open Play Test and use <span className="text-white font-bold">Tweak This Scene</span> to
+                  rewrite any single scene. Re-publish pushes the changes to every player.
+                </span>
+              </div>
+            )}
+
+            {draftSaved && !editingStoryId && (
               <div className="bg-[#064E3B]/30 border border-[#10B981]/40 rounded-2xl p-5 text-[#34D399] text-[15px] font-bold flex items-center gap-3">
                 <CheckCircle2 className="w-5 h-5 flex-shrink-0" />
-                <span>Draft saved. Publishing to the live catalog is a separate, manual review step.</span>
+                <span>Published to the live catalog.</span>
               </div>
             )}
 
             {!hasCompletedPlaythrough && (
               <div className="bg-[#1C1635] border border-[#2D1B4E] rounded-2xl p-5 text-[#C4B5FD] text-[13px] leading-relaxed flex items-start gap-3">
                 <AlertTriangle className="w-4 h-4 text-[#A78BFA] flex-shrink-0 mt-0.5" />
-                <span>Play-test the story through to an ending at least once before you can save it as a draft. This is what confirms the branch structure actually works end to end.</span>
+                <span>Play-test the story through to an ending at least once before you can publish it. This is what confirms the branch structure actually works end to end.</span>
+              </div>
+            )}
+
+            {assetGenError && (
+              <div className="bg-[#422006]/30 border border-[#EAB308]/40 rounded-2xl p-4 text-[#FDE047] text-[13px] leading-relaxed flex items-start gap-3">
+                <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                <span className="flex-1">{assetGenError}</span>
+                <button onClick={() => setAssetGenError(null)} className="text-[#FDE047]/60 hover:text-[#FDE047] flex-shrink-0">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
+            {!imageApiKey && (
+              <div className="bg-[#120F24] border border-[#2D1B4E] rounded-2xl p-4 text-[#8A7DAB] text-[12px] leading-relaxed flex items-start gap-3">
+                <Palette className="w-4 h-4 text-[#A78BFA] flex-shrink-0 mt-0.5" />
+                <span className="flex-1">
+                  Add an image API key in <span className="text-[#C4B5FD] font-bold">Engine Config → Asset Art</span> to
+                  generate portraits and backgrounds without leaving this screen.
+                </span>
               </div>
             )}
 
@@ -1292,6 +2123,14 @@ export default function CreatorApp() {
                     onUpload={(exprId, file) => handleAssetFileChange('characters', c.name, file, exprId)}
                     onCopyPrompt={handleCopyExpressionPrompt}
                     copiedKey={copiedExpr}
+                    onGenerate={(character, expr) => handleGenerateAsset(
+                      'characters',
+                      character.name,
+                      [character.base_description || character.description, expr.note].filter(Boolean).join(' — '),
+                      expr.id,
+                    )}
+                    generatingKey={generatingAssetKey}
+                    canGenerate={!!imageApiKey}
                   />
                 ))}
               </div>
@@ -1303,7 +2142,16 @@ export default function CreatorApp() {
               </div>
               <div className="space-y-3">
                 {(assetManifest?.backgrounds || []).map(b => (
-                  <AssetRow key={b.id} id={b.id} description={b.description} preview={assetFiles.backgrounds[b.id]?.previewUrl || assetFiles.backgrounds[b.id]?.uploadedUrl} onFile={(f) => handleAssetFileChange('backgrounds', b.id, f)} />
+                  <AssetRow
+                    key={b.id}
+                    id={b.id}
+                    description={b.description}
+                    preview={assetFiles.backgrounds[b.id]?.previewUrl || assetFiles.backgrounds[b.id]?.uploadedUrl}
+                    onFile={(f) => handleAssetFileChange('backgrounds', b.id, f)}
+                    onGenerate={() => handleGenerateAsset('backgrounds', b.id, b.description)}
+                    isGenerating={generatingAssetKey === `backgrounds__${b.id}`}
+                    canGenerate={!!imageApiKey}
+                  />
                 ))}
               </div>
             </div>
@@ -1315,9 +2163,16 @@ export default function CreatorApp() {
               <div className="space-y-3 pb-4">
                 <AssetRow
                   id="Cover Image"
-                  description={assetManifest?.cover?.description || "Key art for your visual novel cover."}
+                  description={assetManifest?.cover?.description || `Poster-style key art for "${title}" — ${genre}, ${tone}.`}
                   preview={assetFiles.cover.cover?.previewUrl || assetFiles.cover.cover?.uploadedUrl}
                   onFile={(f) => handleAssetFileChange('cover', 'cover', f)}
+                  onGenerate={() => handleGenerateAsset(
+                    'cover',
+                    'cover',
+                    assetManifest?.cover?.description || `Poster-style key art for "${title}" — ${genre}, ${tone}.`
+                  )}
+                  isGenerating={generatingAssetKey === 'cover__cover'}
+                  canGenerate={!!imageApiKey}
                 />
               </div>
             </div>
@@ -1332,12 +2187,14 @@ export default function CreatorApp() {
           </button>
           <button
             onClick={() => setShowPublishConfirm(true)}
-            disabled={!hasCompletedPlaythrough || isSavingDraft || !!publishedStoryId}
+            disabled={!hasCompletedPlaythrough || isSavingDraft || (!!publishedStoryId && !editingStoryId)}
             title={!hasCompletedPlaythrough ? "Play test through to an ending before publishing" : ""}
             className="flex-1 bg-gradient-to-r from-[#9333EA] to-[#7C3AED] hover:from-[#A855F7] hover:to-[#8B5CF6] disabled:from-[#2D1B4E] disabled:to-[#2D1B4E] disabled:text-[#8A7DAB] disabled:opacity-80 disabled:cursor-not-allowed text-white py-[18px] rounded-full font-bold text-[17px] shadow-[0_0_20px_rgba(139,92,246,0.3)] transition-all flex items-center justify-center gap-2"
           >
             {isSavingDraft ? <Loader2 className="w-5 h-5 animate-spin" /> : <CheckCircle2 className="w-5 h-5" />}
-            {isSavingDraft ? 'Publishing...' : publishedStoryId ? 'Published' : 'Publish'}
+            {isSavingDraft
+              ? (editingStoryId ? 'Re-publishing...' : 'Publishing...')
+              : editingStoryId ? 'Re-publish' : publishedStoryId ? 'Published' : 'Publish'}
           </button>
         </div>
       )}
@@ -1496,9 +2353,13 @@ export default function CreatorApp() {
             <div className="w-16 h-16 rounded-full bg-[#2D1B4E] flex items-center justify-center mx-auto mb-6 shadow-inner">
               <CheckCircle2 className="text-white w-8 h-8" />
             </div>
-            <h3 className="text-white font-bold mb-2 text-lg leading-snug">Publish this story?</h3>
+            <h3 className="text-white font-bold mb-2 text-lg leading-snug">
+              {editingStoryId ? 'Push these changes live?' : 'Publish this story?'}
+            </h3>
             <p className="text-[#8A7DAB] text-[13px] leading-relaxed mb-8">
-              "{title}{subtitle ? `: ${subtitle}` : ''}" will go live in the public catalog immediately and become playable by anyone using the app.
+              {editingStoryId
+                ? `"${title}${subtitle ? `: ${subtitle}` : ''}" is already live. Re-publishing replaces the story and its art for every player, including anyone mid-playthrough.`
+                : `"${title}${subtitle ? `: ${subtitle}` : ''}" will go live in the public catalog immediately and become playable by anyone using the app.`}
             </p>
             <div className="flex gap-4">
               <button onClick={() => setShowPublishConfirm(false)} className="flex-1 bg-[#2D1B4E] hover:bg-[#3B0764] text-white py-4 rounded-xl font-bold transition">Cancel</button>
@@ -1507,7 +2368,7 @@ export default function CreatorApp() {
                 disabled={isSavingDraft}
                 className="flex-1 py-4 rounded-xl font-bold text-white shadow-lg transition bg-[#8B5CF6] hover:bg-[#7C3AED] disabled:opacity-50 flex items-center justify-center gap-2"
               >
-                {isSavingDraft && <Loader2 className="w-4 h-4 animate-spin" />} Publish
+                {isSavingDraft && <Loader2 className="w-4 h-4 animate-spin" />} {editingStoryId ? 'Re-publish' : 'Publish'}
               </button>
             </div>
           </div>
@@ -1515,6 +2376,123 @@ export default function CreatorApp() {
       )}
     </div>
   );
+}
+
+/*
+  ============================================================================
+  STUDIO AUTH GATE
+  ============================================================================
+  The creator app used to fall back to supabase.auth.signInAnonymously() on
+  first use. Every anonymous session is a NEW auth.users row, so:
+
+    - a story generated on one phone belonged to a different user than one
+      generated on another, which is why the Story Library never matched
+      across devices even though both apps talk to the same database;
+    - and there is no stable identity to hang row-level security on, so the
+      studio tables had to stay wide open or lock everyone out.
+
+  Both problems go away with real accounts. Create one per team member in
+  Supabase (Authentication → Users → Add user) and add their uid to
+  public.studio_creators — see the migration.
+*/
+function CreatorLogin() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const loginFieldClasses = "w-full bg-[#1C1635] border border-[#2D1B4E] rounded-2xl p-4 text-[15px] text-white focus:outline-none focus:border-[#8B5CF6] focus:ring-1 focus:ring-[#8B5CF6] transition-all placeholder:text-[#4D3A7A]";
+
+  const handleLogin = async (e) => {
+    e?.preventDefault?.();
+    setBusy(true);
+    setError(null);
+    try {
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email: email.trim().toLowerCase(),
+        password,
+      });
+      if (signInError) throw signInError;
+    } catch (err) {
+      setError(err.message || 'Could not sign in.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-black flex items-center justify-center font-sans selection:bg-purple-500/30">
+      <div className="w-full max-w-[420px] h-[100dvh] sm:h-[850px] sm:max-h-[90vh] sm:border-[8px] border-[#1C1635] sm:rounded-[3rem] bg-[#0B0B14] overflow-hidden relative shadow-[0_0_80px_rgba(0,0,0,0.8)] flex flex-col">
+        <div className="flex-1 flex flex-col justify-center px-8">
+          <div className="text-center mb-10">
+            <div className="w-20 h-20 mx-auto mb-5 flex items-center justify-center">
+              <img src={vystoriaLogo} alt="Vystoria" className="w-full h-full object-contain" />
+            </div>
+            <h1 className="text-4xl font-bold font-sans tracking-wide text-white mb-1">Vystoria</h1>
+            <p className="text-lg text-purple-300 font-sans tracking-wide">Story Engine</p>
+            <p className="text-[#4D3A7A] text-[12px] font-bold uppercase tracking-widest mt-4">Studio access only</p>
+          </div>
+
+          <form onSubmit={handleLogin} className="space-y-4">
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="Studio email"
+              autoComplete="username"
+              className={loginFieldClasses}
+            />
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Password"
+              autoComplete="current-password"
+              className={loginFieldClasses}
+            />
+            {error && <p className="text-[#FCA5A5] text-[13px] leading-relaxed px-1">{error}</p>}
+            <button
+              type="submit"
+              disabled={busy || !email || !password}
+              className="w-full bg-gradient-to-r from-[#9333EA] to-[#7C3AED] hover:from-[#A855F7] hover:to-[#8B5CF6] disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold py-[18px] text-[17px] rounded-full shadow-[0_0_30px_rgba(139,92,246,0.4)] transition-all flex items-center justify-center gap-3"
+            >
+              {busy ? <Loader2 className="w-5 h-5 animate-spin" /> : <Key className="w-5 h-5" />}
+              {busy ? 'Signing in...' : 'Enter Studio'}
+            </button>
+          </form>
+
+          <p className="text-[11px] text-[#4D3A7A] leading-relaxed text-center mt-8 px-2">
+            Accounts are created by an admin in Supabase. Every device signed in as a studio creator
+            sees the same drafts and the same published catalog.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function CreatorAppRoot() {
+  const [session, setSession] = useState(undefined); // undefined = still checking
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession ?? null);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  if (session === undefined) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <Loader2 className="w-8 h-8 animate-spin text-[#8B5CF6]" />
+      </div>
+    );
+  }
+
+  if (!session) return <CreatorLogin />;
+
+  return <CreatorApp session={session} onSignOut={() => supabase.auth.signOut()} />;
 }
 
 /*
