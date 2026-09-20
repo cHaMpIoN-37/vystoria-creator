@@ -222,8 +222,15 @@ function CreatorApp({ session, onSignOut }) {
   const [imageApiKey, setImageApiKey] = useState('');
   const [imageModel, setImageModel] = useState('');
   const [artStyle, setArtStyle] = useState(
-    'Moody painterly anime key art, cool desaturated palette, dramatic rim lighting, high detail'
+    'Flat 2D cel-shaded anime illustration, crisp line art, hard-edged shading, cool desaturated palette'
   );
+  // Written to stories.description on publish. The player app reads it for the
+  // featured card blurb and the game-detail synopsis — every story currently
+  // shows "No Desc. available" because nothing has ever written this column.
+  const [storyDescription, setStoryDescription] = useState('');
+  // True once the creator edits the style box by hand, so a later manifest
+  // load doesn't overwrite their wording.
+  const [artStyleTouched, setArtStyleTouched] = useState(false);
   const [generatingAssetKey, setGeneratingAssetKey] = useState(null);
   const [assetGenError, setAssetGenError] = useState(null);
 
@@ -358,6 +365,18 @@ function CreatorApp({ session, onSignOut }) {
     && !!taskId
     && !!checkpointProgress?.has_world_bible;
 
+  // The manifest now carries a synopsis and a one-line art direction. Adopt
+  // both, but never clobber something the creator has already typed.
+  useEffect(() => {
+    if (!assetManifest) return;
+    if (assetManifest.synopsis) {
+      setStoryDescription(prev => prev || assetManifest.synopsis);
+    }
+    if (assetManifest.art_direction && !artStyleTouched) {
+      setArtStyle(assetManifest.art_direction);
+    }
+  }, [assetManifest, artStyleTouched]);
+
 
 
   // --- Workflow locking -----------------------------------------------
@@ -402,6 +421,8 @@ function CreatorApp({ session, onSignOut }) {
     setEditingStoryId(null);
     setEditingStoryUrl(null);
     setAssetGenError(null);
+    setStoryDescription('');
+    setArtStyleTouched(false);
   };
 
   // Where uploaded art lands in the bucket. Normally the task id; when
@@ -491,6 +512,8 @@ function CreatorApp({ session, onSignOut }) {
           .from('stories')
           .update({
             title: `${title}${subtitle ? `: ${subtitle}` : ''}`,
+            subtitle: subtitle || null,
+            description: storyDescription.trim() || null,
             url: storyUrl,
             genre,
             assets,
@@ -517,6 +540,8 @@ function CreatorApp({ session, onSignOut }) {
           .from('stories')
           .insert({
             title: `${title}: ${subtitle}`,
+            subtitle: subtitle || null,
+            description: storyDescription.trim() || null,
             url: storyUrl,
             genre,
             creator_id: user?.id,
@@ -658,7 +683,7 @@ function CreatorApp({ session, onSignOut }) {
     try {
       const { data, error } = await supabase
         .from('stories')
-        .select('id, title, genre, url, cover_image, assets, is_featured, creator_id, created_at, updated_at')
+        .select('id, title, subtitle, description, genre, url, cover_image, assets, is_featured, creator_id, created_at, updated_at')
         .order('created_at', { ascending: false })
         .limit(100);
       if (error) throw error;
@@ -796,6 +821,7 @@ function CreatorApp({ session, onSignOut }) {
       }
 
       setGenre(story.genre || 'Uncategorized');
+      setStoryDescription(story.description || '');
       setPublishedStoryId(story.id);
       setEditingStoryId(story.id);
       setEditingStoryUrl(story.url);
@@ -1685,7 +1711,7 @@ function CreatorApp({ session, onSignOut }) {
                   <FieldLabel>House Art Style</FieldLabel>
                   <textarea
                     value={artStyle}
-                    onChange={(e) => setArtStyle(e.target.value)}
+                    onChange={(e) => { setArtStyle(e.target.value); setArtStyleTouched(true); }}
                     rows={3}
                     placeholder="e.g. Moody painterly anime key art, cool desaturated palette, dramatic rim lighting"
                     className={`${fieldClasses} resize-none`}
@@ -2102,6 +2128,27 @@ function CreatorApp({ session, onSignOut }) {
                 </span>
               </div>
             )}
+
+            <div>
+              <div className="inline-flex items-center gap-2 bg-[#1C1635] px-4 py-2 rounded-full mb-4">
+                <h4 className="text-[#A78BFA] font-bold text-xs tracking-widest uppercase">Store Description</h4>
+              </div>
+              <p className="text-[11px] text-[#4D3A7A] italic mb-3 pl-1 leading-relaxed">
+                Shown on the featured card and the game detail screen in the player app. Two or three
+                sentences works best — the featured card clamps to two lines.
+              </p>
+              <textarea
+                value={storyDescription}
+                onChange={(e) => setStoryDescription(e.target.value)}
+                rows={4}
+                placeholder="Back-cover blurb — the engine drafts one for you when the asset manifest is built."
+                className={`${fieldClasses} resize-none`}
+              />
+              <p className={`text-[11px] mt-2 pl-1 ${storyDescription.length > 240 ? 'text-[#FDE047]' : 'text-[#4D3A7A]'}`}>
+                {storyDescription.length} characters
+                {storyDescription.length > 240 && ' — the featured card will clamp this to two lines.'}
+              </p>
+            </div>
 
             <div>
               <div className="inline-flex items-center gap-2 bg-[#1C1635] px-4 py-2 rounded-full mb-4">
