@@ -131,10 +131,12 @@ const ASSET_FORMAT_RULES = {
     label: 'Character portrait',
     format: 'Aspect ratio 3:4 (vertical portrait). Suggested size 1024 × 1365 px, PNG with transparency.',
     composition:
-      'Full-body reference of ONE single figure, standing, facing the viewer, in a neutral ' +
-      'relaxed pose. Figure centred, with the whole body from the top of the head to the ' +
-      'soles of the feet inside the frame and clear margin above and below — do not crop ' +
-      'the head or the feet.\n' +
+      'Upper-body portrait of ONE single figure, cropped at roughly the waist — from the ' +
+      'top of the head down to the belt line only. Do NOT show the legs, hips, or feet; ' +
+      'this is a "bust" character sprite, not a full-body reference.\n' +
+      'Facing the viewer in a neutral relaxed pose, figure centred and scaled so the upper ' +
+      'body fills most of the frame vertically, with clear margin only above the head — do ' +
+      'not leave large empty space below the crop; zoom in rather than shrink the figure.\n' +
       'COMPLETELY TRANSPARENT BACKGROUND. Nothing at all behind the figure: no scenery, no ' +
       'room, no floor, no ground, no cast shadow, no drop shadow, no colour fill, no ' +
       'gradient, no backdrop, no props. Clean sharp silhouette edges, ready to cut out and ' +
@@ -2473,6 +2475,9 @@ function CreatorApp({ session, onSignOut }) {
             {scorecard && scorecard.status !== 'ERROR' && (
               <div className="space-y-5 mt-2">
                 <p className="text-[#C4B5FD] text-[15px] leading-relaxed italic border-l-2 border-[#8B5CF6] pl-4">{scorecard.summary}</p>
+                {scorecard.model_used && (
+                  <p className="text-[#8A7DAB] text-[11px] pl-4">Judged by {scorecard.model_used}</p>
+                )}
 
                 <div className="space-y-3">
                   {Object.entries(JUDGE_RUBRIC_META).map(([key, meta]) => {
@@ -2539,6 +2544,7 @@ function CreatorApp({ session, onSignOut }) {
         <PlayTestEngine
           storyData={resultJson}
           assetFiles={assetFiles}
+          assetManifest={assetManifest}
           title={title}
           subtitle={subtitle}
           taskId={taskId}
@@ -2707,7 +2713,7 @@ export default function CreatorAppRoot() {
   ============================================================================
 */
 function PlayTestEngine({
-  storyData, assetFiles, title, subtitle, taskId, onClose,
+  storyData, assetFiles, assetManifest, title, subtitle, taskId, onClose,
   onCompletePlaythrough, onSceneUpdate, worldBible, provider, apiKey, modelName,
   onPublish
 }) {
@@ -2843,6 +2849,7 @@ function PlayTestEngine({
           world_bible: worldBible || '',
           scene: currentScene,
           instruction: tweakInstruction.trim(),
+          asset_manifest: assetManifest,
         }),
       });
       if (!response.ok) {
@@ -2887,7 +2894,7 @@ function PlayTestEngine({
 
   return (
     <div className="fixed inset-0 z-[999] bg-black flex items-center justify-center p-0 sm:p-6">
-      <div className="w-full h-full sm:h-[850px] sm:max-h-[90vh] sm:max-w-[420px] relative overflow-hidden bg-[#0B0B14] text-white shadow-2xl sm:rounded-[3rem] sm:border-[8px] sm:border-[#1C1635] flex flex-col justify-center">
+      <div className="w-full h-full sm:w-[90vw] sm:max-w-[1000px] sm:h-[42.6vw] sm:max-h-[473px] relative overflow-hidden bg-[#0B0B14] text-white shadow-2xl sm:rounded-[3rem] sm:border-[8px] sm:border-[#1C1635] flex flex-col justify-center">
 
         <div className="absolute top-6 right-6 z-50 w-10 h-10 bg-[#120F24]/80 backdrop-blur-md rounded-full flex items-center justify-center cursor-pointer hover:bg-[#2D1B4E] transition border border-[#2D1B4E]" onClick={onClose}>
           <X className="text-[#A78BFA] w-5 h-5" />
