@@ -52,7 +52,8 @@ import {
   Cpu, BookOpen, Terminal, Scale, Image as ImageIcon, Sparkles, Loader2, Key,
   Play, CheckCircle2, AlertTriangle, RefreshCw, XCircle, MinusCircle, ChevronDown,
   ArrowLeft, Menu, ArrowRight, Save, Download, X, Wand2, FileText, RotateCcw,
-  Copy, Check, Star, Globe, LogOut, PlayCircle, Palette
+  Copy, Check, Star, Globe, LogOut, PlayCircle, Palette,
+  SlidersHorizontal, Eye, EyeOff, Lock, Minus, Plus
 } from 'lucide-react';
 
 // --- SUPABASE CONFIGURATION (Same as the player app) ---
@@ -737,16 +738,25 @@ function CreatorApp({ session, onSignOut }) {
     }
   };
 
-  // Hot-swap a single revised scene into resultJson after a tweak.
+  // Hot-swap a single revised scene into resultJson after a tweak or a
+  // hand-edit of its effects, and write it back to the draft row. It used to
+  // live only in React state, so any edit was lost on refresh unless the
+  // story was published first. (The task poller only runs while a task is
+  // pending/generating, so it can't race this write.)
   const handleSceneUpdate = (updatedScene) => {
-    setResultJson(prev => {
-      if (!prev) return prev;
-      return {
-        ...prev,
-        scenes: prev.scenes.map(s => (s.id === updatedScene.id ? updatedScene : s)),
-      };
-    });
-    setLogs(prev => [...prev, `🪄 Scene "${updatedScene.id}" was rewritten per your instruction.`]);
+    if (!resultJson) return;
+    const next = {
+      ...resultJson,
+      scenes: resultJson.scenes.map(s => (s.id === updatedScene.id ? updatedScene : s)),
+    };
+    setResultJson(next);
+    setLogs(prev => [...prev, `🪄 Scene "${updatedScene.id}" was updated.`]);
+    if (taskId) {
+      supabase.from('generation_tasks').update({ result_json: next }).eq('id', taskId)
+        .then(({ error }) => {
+          if (error) setLogs(prev => [...prev, `[Error] Couldn't save the edit to the draft: ${error.message}`]);
+        });
+    }
   };
 
   // Persists that the creator reached a real ending, so Publish stays
@@ -2712,6 +2722,136 @@ export default function CreatorAppRoot() {
   PLAY-TEST ENGINE (Styled to match the new dark mobile UI)
   ============================================================================
 */
+// ---------------------------------------------------------------------------
+// STORY STATE (Phase 3). Twin of the "4b. STORY STATE" section in the
+// backend — evaluate_condition / apply_effects / sanitize_effects there must
+// behave exactly like evalCondition / applyEffects / sanitizeEffects here.
+// A story with no `state` block is a legacy story: every helper below is a
+// no-op for it, so it plays exactly as before.
+// ---------------------------------------------------------------------------
+const STATE_NUMERIC_KINDS = new Set(['stat', 'relationship', 'clock']);
+const STATE_BOOLEAN_KINDS = new Set(['flag', 'milestone']);
+
+const getStateVars = (story) =>
+  (Array.isArray(story?.state?.variables) ? story.state.variables : []).filter(v => v && typeof v.id === 'string');
+
+const storyHasState = (story) => getStateVars(story).length > 0;
+
+const isStateInt = (v) => typeof v === 'number' && Number.isInteger(v);
+
+const clampStateValue = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+const buildInitialState = (story) => {
+  const out = {};
+  for (const v of getStateVars(story)) {
+    if (STATE_NUMERIC_KINDS.has(v.kind)) {
+      const lo = isStateInt(v.min) ? v.min : 0;
+      const hi = isStateInt(v.max) ? v.max : lo;
+      out[v.id] = clampStateValue(isStateInt(v.initial) ? v.initial : lo, lo, hi);
+    } else if (STATE_BOOLEAN_KINDS.has(v.kind)) {
+      out[v.id] = v.initial === true;
+    }
+  }
+  return out;
+};
+
+// A save/autosave may come from an older version of the story (the creator
+// republished with a changed declaration). Keep every value that still fits
+// the current declaration, default the rest.
+const sanitizeLoadedState = (story, raw) => {
+  const out = buildInitialState(story);
+  if (!raw || typeof raw !== 'object') return out;
+  for (const v of getStateVars(story)) {
+    const val = raw[v.id];
+    if (STATE_NUMERIC_KINDS.has(v.kind) && isStateInt(val)) out[v.id] = clampStateValue(val, v.min, v.max);
+    else if (STATE_BOOLEAN_KINDS.has(v.kind) && typeof val === 'boolean') out[v.id] = val;
+  }
+  return out;
+};
+
+const applyEffects = (story, state, effects) => {
+  if (!effects || typeof effects !== 'object') return state;
+  const byId = Object.fromEntries(getStateVars(story).map(v => [v.id, v]));
+  const out = { ...state };
+  for (const [id, val] of Object.entries(effects)) {
+    const v = byId[id];
+    if (!v || !(id in out)) continue;
+    if (STATE_BOOLEAN_KINDS.has(v.kind)) {
+      if (typeof val === 'boolean') out[id] = val;
+    } else if (isStateInt(val)) {
+      out[id] = clampStateValue(out[id] + val, v.min, v.max);
+    }
+  }
+  return out;
+};
+
+const stateSameTypedEqual = (a, b) => (typeof a === 'boolean') === (typeof b === 'boolean') && a === b;
+
+// null/undefined = always true; anything malformed = false.
+const evalCondition = (state, cond, depth = 0) => {
+  if (cond === null || cond === undefined) return true;
+  if (typeof cond !== 'object' || Array.isArray(cond) || depth > 6) return false;
+  if (Array.isArray(cond.all)) return cond.all.every(c => evalCondition(state, c, depth + 1));
+  if (Array.isArray(cond.any)) return cond.any.some(c => evalCondition(state, c, depth + 1));
+  const { var: id, op, value: b } = cond;
+  if (typeof id !== 'string' || typeof op !== 'string' || !state || !(id in state)) return false;
+  const a = state[id];
+  if (op === '==') return stateSameTypedEqual(a, b);
+  if (op === '!=') return !stateSameTypedEqual(a, b);
+  if (!isStateInt(a) || !isStateInt(b)) return false;
+  if (op === '>=') return a >= b;
+  if (op === '<=') return a <= b;
+  if (op === '>') return a > b;
+  if (op === '<') return a < b;
+  return false;
+};
+
+const formatCondition = (cond) => {
+  if (cond === null || cond === undefined) return 'always';
+  const wrap = (c) => (c && (c.all || c.any) ? `(${formatCondition(c)})` : formatCondition(c));
+  if (Array.isArray(cond.all)) return cond.all.map(wrap).join(' AND ');
+  if (Array.isArray(cond.any)) return cond.any.map(wrap).join(' OR ');
+  return `${cond.var} ${cond.op} ${typeof cond.value === 'boolean' ? String(cond.value) : cond.value}`;
+};
+
+// The options the player is actually offered. If a state somehow locks
+// every option, fail open and show them all — a soft-lock is worse than a
+// choice the story didn't strictly intend.
+const getVisibleChoices = (scene, state) => {
+  const all = Array.isArray(scene?.choices) ? scene.choices : [];
+  const visible = all.filter(c => evalCondition(state, c?.condition));
+  return visible.length ? visible : all;
+};
+
+// Where a scene with no choices goes next: first route whose condition
+// passes, otherwise next_scene_default (which may be empty = an ending).
+const resolveNextSceneId = (scene, state) => {
+  for (const r of (Array.isArray(scene?.routes) ? scene.routes : [])) {
+    if (r?.next_scene && evalCondition(state, r.condition)) return r.next_scene;
+  }
+  return scene?.next_scene_default || null;
+};
+
+// Same rules as the backend's sanitize_effects — used by the creator's
+// hand-edit panel so a manual edit can't store something the engine rejects.
+const sanitizeEffects = (story, effects) => {
+  if (!effects || typeof effects !== 'object') return null;
+  const byId = Object.fromEntries(getStateVars(story).map(v => [v.id, v]));
+  const out = {};
+  for (const [id, val] of Object.entries(effects)) {
+    const v = byId[id];
+    if (!v) continue;
+    if (STATE_BOOLEAN_KINDS.has(v.kind)) {
+      if (typeof val === 'boolean') out[id] = val;
+    } else if (isStateInt(val) && val !== 0) {
+      if (v.kind === 'clock' && val < 0) continue;
+      const span = v.max - v.min;
+      out[id] = clampStateValue(val, -span, span);
+    }
+  }
+  return Object.keys(out).length ? out : null;
+};
+
 function PlayTestEngine({
   storyData, assetFiles, assetManifest, title, subtitle, taskId, onClose,
   onCompletePlaythrough, onSceneUpdate, worldBible, provider, apiKey, modelName,
@@ -2723,6 +2863,18 @@ function PlayTestEngine({
   const [saveSlots, setSaveSlots] = useState(Array(8).fill(null));
   const [playerError, setPlayerError] = useState(null);
 
+  // Story state (Phase 3). A legacy story has no variables, so this stays {}
+  // and every helper below is a no-op — it plays exactly as it always did.
+  const hasState = storyHasState(storyData);
+  const [storyState, setStoryState] = useState(() => buildInitialState(storyData));
+  const [showStatePanel, setShowStatePanel] = useState(false);
+  const [showEffects, setShowEffects] = useState(true); // test build shows effects; the player app never does
+
+  // Hand-edit effects (no LLM round-trip)
+  const [showEffectsEditor, setShowEffectsEditor] = useState(false);
+  const [effectsDraft, setEffectsDraft] = useState(null);
+  const [effectsEditorError, setEffectsEditorError] = useState(null);
+
   // Scene tweak modal state
   const [showTweakModal, setShowTweakModal] = useState(false);
   const [tweakInstruction, setTweakInstruction] = useState('');
@@ -2733,8 +2885,17 @@ function PlayTestEngine({
 
   const currentScene = storyData?.scenes?.find(s => s.id === currentSceneId) || storyData?.scenes?.[0] || {};
   const sequenceList = currentScene.sequence || [];
-  const currentSequenceBlock = sequenceList[sequenceIndex] || {};
-  const isEndOfSequence = sequenceIndex >= sequenceList.length - 1;
+  // sequenceIndex === sequenceList.length means "past the last line, showing
+  // the choices". FIX: the old test (index >= length - 1) swapped in the
+  // choice panel as soon as the LAST line was reached, so the line right
+  // before every choice was never displayed. The last speaker's block stays
+  // current while choosing, so their portrait remains on screen.
+  const lineIndex = Math.min(sequenceIndex, Math.max(0, sequenceList.length - 1));
+  const currentSequenceBlock = sequenceList[lineIndex] || {};
+  const hasChoicesHere = Array.isArray(currentScene.choices) && currentScene.choices.length > 0;
+  const showingChoices = hasChoicesHere && sequenceIndex >= sequenceList.length;
+  const stateVars = getStateVars(storyData);
+  const declaredEndings = Array.isArray(storyData?.state?.endings) ? storyData.state.endings : [];
 
   const bgUrl = assetFiles?.backgrounds?.[currentScene.background]?.previewUrl
              || assetFiles?.backgrounds?.[currentScene.background]?.uploadedUrl
@@ -2769,22 +2930,43 @@ function PlayTestEngine({
     })();
   }, [taskId]);
 
+  // Every scene change goes through here, so a scene's arrival effects are
+  // applied exactly once per arrival — never from a render or an effect hook.
+  const enterScene = (sceneId, baseState) => {
+    const scene = storyData?.scenes?.find(s => s.id === sceneId);
+    setStoryState(scene ? applyEffects(storyData, baseState, scene.effects) : baseState);
+    setCurrentSceneId(sceneId);
+    setSequenceIndex(0);
+  };
+
+  const startNewGame = () => {
+    setPlayerError(null);
+    enterScene(storyData?.starting_scene || storyData?.scenes?.[0]?.id, buildInitialState(storyData));
+    setPlayerState('playing');
+  };
+
   const advanceStory = () => {
     if (!storyData) return;
-    const sequenceLength = currentScene.sequence?.length || 1;
-    const isEndOfSeq = sequenceIndex >= sequenceLength - 1;
-    const hasChoices = currentScene.choices && currentScene.choices.length > 0;
-    const nextSceneExists = storyData.scenes?.some(s => s.id === currentScene.next_scene_default);
+    const sequenceLength = currentScene.sequence?.length || 0;
 
-    if (!isEndOfSeq) {
+    if (sequenceIndex < sequenceLength - 1) {
       setSequenceIndex(prev => prev + 1);
-    } else if (currentScene.next_scene_default && nextSceneExists) {
-      setCurrentSceneId(currentScene.next_scene_default);
-      setSequenceIndex(0);
-    } else if (!hasChoices) {
-      onCompletePlaythrough?.();
-      setPlayerState('story_end');
+      return;
     }
+    if (hasChoicesHere) {
+      // Past the last line: now show the choices.
+      if (sequenceIndex < sequenceLength) setSequenceIndex(sequenceLength);
+      return;
+    }
+
+    // First conditional route that passes, else next_scene_default.
+    const nextId = resolveNextSceneId(currentScene, storyState);
+    if (nextId && storyData.scenes?.some(s => s.id === nextId)) {
+      enterScene(nextId, storyState);
+      return;
+    }
+    onCompletePlaythrough?.();
+    setPlayerState('story_end');
   };
 
   // FIX: previously this navigated to whatever `nextSceneId` a choice
@@ -2795,11 +2977,11 @@ function PlayTestEngine({
   // the beginning" instead of reaching an ending. Now an unresolvable
   // target is treated as a real dead end and surfaced clearly, instead of
   // silently resetting progress.
-  const handleChoice = (nextSceneId) => {
+  const handleChoice = (choice) => {
+    const nextSceneId = choice?.next_scene;
     const targetExists = !!nextSceneId && storyData?.scenes?.some(s => s.id === nextSceneId);
     if (targetExists) {
-      setCurrentSceneId(nextSceneId);
-      setSequenceIndex(0);
+      enterScene(nextSceneId, applyEffects(storyData, storyState, choice.effects));
     } else {
       setPlayerError("Dead End: this choice has no valid next_scene set.");
     }
@@ -2807,7 +2989,7 @@ function PlayTestEngine({
 
   const handleSaveSlot = async (idx) => {
     const newSlots = [...saveSlots];
-    newSlots[idx] = { sceneId: currentSceneId, date: new Date().toLocaleString() };
+    newSlots[idx] = { sceneId: currentSceneId, sequenceIndex, state: storyState, date: new Date().toLocaleString() };
     setSaveSlots(newSlots);
 
     if (taskId) {
@@ -2823,11 +3005,25 @@ function PlayTestEngine({
 
   const handleLoadSlot = (idx) => {
     const slot = saveSlots[idx];
-    if (slot && slot.sceneId) {
-      setCurrentSceneId(slot.sceneId);
-      setSequenceIndex(0);
-      setPlayerState('playing');
+    if (!slot || !slot.sceneId) return;
+    const scene = storyData?.scenes?.find(s => s.id === slot.sceneId);
+    if (!scene) {
+      setPlayerError('That save points at a scene that no longer exists in this draft.');
+      return;
     }
+    setPlayerError(null);
+    if (slot.state) {
+      // The saved state already includes that scene's arrival effects.
+      setStoryState(sanitizeLoadedState(storyData, slot.state));
+      setCurrentSceneId(slot.sceneId);
+      // Up to length (not length - 1): a save made while choosing restores to the choices.
+      const maxIdx = scene.sequence?.length || 0;
+      setSequenceIndex(Math.min(Math.max(0, Number(slot.sequenceIndex) || 0), maxIdx));
+    } else {
+      // A slot saved before story state existed carries no variables.
+      enterScene(slot.sceneId, buildInitialState(storyData));
+    }
+    setPlayerState('playing');
   };
 
   const handleTweakSubmit = async () => {
@@ -2850,6 +3046,7 @@ function PlayTestEngine({
           scene: currentScene,
           instruction: tweakInstruction.trim(),
           asset_manifest: assetManifest,
+          story_state: storyData?.state || null,
         }),
       });
       if (!response.ok) {
@@ -2872,6 +3069,105 @@ function PlayTestEngine({
     }
   };
 
+  // ---- State panel helpers ----
+  const setVarValue = (v, value) => {
+    setStoryState(prev => {
+      if (STATE_BOOLEAN_KINDS.has(v.kind)) return { ...prev, [v.id]: !!value };
+      return { ...prev, [v.id]: clampStateValue(value, v.min, v.max) };
+    });
+  };
+
+  const formatEffects = (effects) =>
+    Object.entries(effects || {}).map(([k, val]) =>
+      typeof val === 'boolean' ? `${k} = ${val}` : `${k} ${val > 0 ? '+' : ''}${val}`
+    );
+
+  const activeEnding = declaredEndings.find(e => evalCondition(storyState, e.condition));
+
+  // ---- Effects editor ----
+  // Draft values are strings from the inputs: '' = no effect.
+  const toDraft = (effects) => Object.fromEntries(stateVars.map(v => {
+    const val = effects?.[v.id];
+    return [v.id, val === undefined || val === null ? '' : String(val)];
+  }));
+
+  const openEffectsEditor = () => {
+    setEffectsDraft({
+      scene: toDraft(currentScene.effects),
+      choices: (currentScene.choices || []).map(c => toDraft(c.effects)),
+    });
+    setEffectsEditorError(null);
+    setShowEffectsEditor(true);
+  };
+
+  const parseDraft = (draft, where) => {
+    const raw = {};
+    for (const v of stateVars) {
+      const text = (draft[v.id] ?? '').trim();
+      if (text === '') continue;
+      if (STATE_BOOLEAN_KINDS.has(v.kind)) {
+        raw[v.id] = text === 'true';
+        continue;
+      }
+      const n = Number(text);
+      if (!Number.isInteger(n)) throw new Error(`${where}: "${v.id}" needs a whole number (e.g. 1 or -2).`);
+      if (v.kind === 'clock' && n < 0) throw new Error(`${where}: the clock "${v.id}" can only move forward.`);
+      if (Math.abs(n) > v.max - v.min) throw new Error(`${where}: "${v.id}" can change by at most ${v.max - v.min}.`);
+      raw[v.id] = n;
+    }
+    return sanitizeEffects(storyData, raw);
+  };
+
+  const saveEffectsEdit = () => {
+    try {
+      const sceneEffects = parseDraft(effectsDraft.scene, 'On arrival');
+      const updated = { ...currentScene };
+      if (sceneEffects) updated.effects = sceneEffects; else delete updated.effects;
+      if (Array.isArray(currentScene.choices)) {
+        updated.choices = currentScene.choices.map((c, i) => {
+          const eff = parseDraft(effectsDraft.choices[i] || {}, `Choice "${c.text}"`);
+          const next = { ...c };
+          if (eff) next.effects = eff; else delete next.effects;
+          return next;
+        });
+      }
+      onSceneUpdate?.(updated);
+      setShowEffectsEditor(false);
+    } catch (err) {
+      setEffectsEditorError(err.message);
+    }
+  };
+
+  const renderEffectInputs = (draft, onChange) => (
+    <div className="grid grid-cols-2 gap-2">
+      {stateVars.map(v => (
+        <label key={v.id} className="flex items-center justify-between gap-2 bg-[#0B0B14] border border-[#2D1B4E] rounded-xl px-3 py-2">
+          <span className="text-[12px] font-mono text-[#C4B5FD] truncate">{v.id}</span>
+          {STATE_BOOLEAN_KINDS.has(v.kind) ? (
+            <select
+              value={draft[v.id] ?? ''}
+              onChange={(e) => onChange(v.id, e.target.value)}
+              className="bg-[#120F24] border border-[#2D1B4E] rounded-lg text-white text-[12px] px-2 py-1 focus:outline-none focus:border-[#8B5CF6]"
+            >
+              <option value="">—</option>
+              <option value="true">set true</option>
+              <option value="false">set false</option>
+            </select>
+          ) : (
+            <input
+              type="number"
+              step="1"
+              value={draft[v.id] ?? ''}
+              placeholder="—"
+              onChange={(e) => onChange(v.id, e.target.value)}
+              className="w-16 bg-[#120F24] border border-[#2D1B4E] rounded-lg text-white text-[12px] px-2 py-1 text-right focus:outline-none focus:border-[#8B5CF6]"
+            />
+          )}
+        </label>
+      ))}
+    </div>
+  );
+
   const Backdrop = ({ blurred }) => (
     <div className="absolute inset-0 z-0">
       {bgUrl ? (
@@ -2892,6 +3188,11 @@ function PlayTestEngine({
     );
   }
 
+  const primaryBtn = "w-full bg-[#7C3AED] hover:bg-[#8B5CF6] text-white font-bold py-3 rounded-2xl shadow-[0_0_20px_rgba(124,58,237,0.4)] text-[15px] transition-all transform active:scale-95";
+  const secondaryBtn = "w-full bg-[#2D1B4E]/80 backdrop-blur-md hover:bg-[#3B0764] text-white font-bold py-3 rounded-2xl text-[15px] transition border border-[#4D3A7A]/50";
+
+  const visibleChoices = getVisibleChoices(currentScene, storyState);
+
   return (
     <div className="fixed inset-0 z-[999] bg-black flex items-center justify-center p-0 sm:p-6">
       <div className="w-full h-full sm:w-[90vw] sm:max-w-[1000px] sm:h-[42.6vw] sm:max-h-[473px] relative overflow-hidden bg-[#0B0B14] text-white shadow-2xl sm:rounded-[3rem] sm:border-[8px] sm:border-[#1C1635] flex flex-col justify-center">
@@ -2901,11 +3202,11 @@ function PlayTestEngine({
         </div>
 
         <div
-          className="absolute top-6 left-6 z-50 bg-[#120F24]/80 backdrop-blur-md border border-[#2D1B4E] text-[#C4B5FD] text-[11px] font-mono px-4 py-2 rounded-full flex items-center gap-2 cursor-pointer hover:bg-[#2D1B4E] transition-colors"
+          className="absolute top-6 left-6 z-50 max-w-[70%] bg-[#120F24]/80 backdrop-blur-md border border-[#2D1B4E] text-[#C4B5FD] text-[11px] font-mono px-4 py-2 rounded-full flex items-center gap-2 cursor-pointer hover:bg-[#2D1B4E] transition-colors"
           onClick={() => { if (playerState === 'playing') setPlayerState('paused'); }}
         >
-           <Menu className="w-3.5 h-3.5 opacity-70" />
-           <span>
+           <Menu className="w-3.5 h-3.5 opacity-70 flex-shrink-0" />
+           <span className="truncate">
              scene: {currentScene.id || '—'} · bg: {currentScene.background || '—'}{!bgUrl && ' (no art)'}
              {currentSequenceBlock.speaker && currentSequenceBlock.expression && (
                <> · {currentSequenceBlock.speaker}:{currentSequenceBlock.expression}{!portraitUrl && ' (no art)'}</>
@@ -2914,12 +3215,20 @@ function PlayTestEngine({
         </div>
 
         {playerState === 'playing' && (
-          <button
-            onClick={() => { setTweakError(null); setShowTweakModal(true); }}
-            className="absolute top-[82px] left-6 z-50 bg-[#120F24]/80 backdrop-blur-md border border-[#8B5CF6]/40 text-[#C4B5FD] text-[11px] font-bold px-4 py-2 rounded-full flex items-center gap-2 hover:bg-[#2D1B4E] transition-colors"
-          >
-            <Wand2 className="w-3.5 h-3.5" /> Tweak This Scene
-          </button>
+          <div className="absolute top-[68px] left-6 z-50 flex items-center gap-2">
+            <button
+              onClick={() => { setTweakError(null); setShowTweakModal(true); }}
+              className="bg-[#120F24]/80 backdrop-blur-md border border-[#8B5CF6]/40 text-[#C4B5FD] text-[11px] font-bold px-4 py-2 rounded-full flex items-center gap-2 hover:bg-[#2D1B4E] transition-colors"
+            >
+              <Wand2 className="w-3.5 h-3.5" /> Tweak This Scene
+            </button>
+            <button
+              onClick={() => setShowStatePanel(v => !v)}
+              className={`backdrop-blur-md border text-[11px] font-bold px-4 py-2 rounded-full flex items-center gap-2 transition-colors ${showStatePanel ? 'bg-[#3B0764] border-[#8B5CF6] text-white' : 'bg-[#120F24]/80 border-[#8B5CF6]/40 text-[#C4B5FD] hover:bg-[#2D1B4E]'}`}
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5" /> State
+            </button>
+          </div>
         )}
 
         {showTweakModal && (
@@ -2952,34 +3261,70 @@ function PlayTestEngine({
           </div>
         )}
 
+        {showEffectsEditor && effectsDraft && (
+          <div className="fixed inset-0 z-[70] bg-black/85 backdrop-blur-sm flex items-center justify-center p-6" onClick={() => setShowEffectsEditor(false)}>
+            <div className="bg-[#120F24] border border-[#2D1B4E] rounded-3xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto no-scrollbar shadow-2xl" onClick={e => e.stopPropagation()}>
+              <h3 className="text-white text-lg font-bold mb-1">Edit effects</h3>
+              <p className="text-[#8A7DAB] text-[13px] mb-4 leading-relaxed">
+                Scene <span className="text-[#C4B5FD] font-mono">{currentScene.id}</span>. Numbers are changes (+1, -2), not totals; leave a box empty for no effect. Saved straight into the draft — no AI call. Changes apply the next time this scene or choice is used.
+              </p>
+
+              <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase mb-2">On arrival</p>
+              <div className="mb-4">
+                {renderEffectInputs(effectsDraft.scene, (id, val) =>
+                  setEffectsDraft(d => ({ ...d, scene: { ...d.scene, [id]: val } })))}
+              </div>
+
+              {(currentScene.choices || []).map((c, i) => (
+                <div key={i} className="mb-4">
+                  <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase mb-2">Choice: “{c.text}”</p>
+                  {renderEffectInputs(effectsDraft.choices[i] || {}, (id, val) =>
+                    setEffectsDraft(d => {
+                      const choices = [...d.choices];
+                      choices[i] = { ...(choices[i] || {}), [id]: val };
+                      return { ...d, choices };
+                    }))}
+                </div>
+              ))}
+
+              {effectsEditorError && <p className="text-[#FCA5A5] text-[13px] mb-4 leading-relaxed">{effectsEditorError}</p>}
+              <div className="flex gap-3">
+                <button onClick={() => setShowEffectsEditor(false)} className="flex-1 bg-transparent border border-[#3B0764] text-white font-bold py-3 rounded-xl text-[14px]">Cancel</button>
+                <button onClick={saveEffectsEdit} className="flex-1 bg-[#7C3AED] hover:bg-[#8B5CF6] text-white font-bold py-3 rounded-xl text-[14px]">Save Effects</button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {playerError && (
           <div className="absolute inset-0 z-[60] bg-black/90 backdrop-blur-sm flex items-center justify-center p-6">
-            <div className="bg-[#120F24] border border-[#EF4444]/40 rounded-3xl p-8 max-w-sm w-full text-center shadow-2xl">
-              <div className="w-16 h-16 bg-[#EF4444]/20 rounded-full flex items-center justify-center mx-auto mb-6">
-                 <AlertTriangle className="w-8 h-8 text-[#FCA5A5]" />
+            <div className="bg-[#120F24] border border-[#EF4444]/40 rounded-3xl p-6 max-w-sm w-full text-center shadow-2xl">
+              <div className="w-12 h-12 bg-[#EF4444]/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                 <AlertTriangle className="w-6 h-6 text-[#FCA5A5]" />
               </div>
               <p className="text-white text-xl font-bold mb-2">Dead End Reached</p>
-              <p className="text-[#8A7DAB] text-[14px] leading-relaxed mb-8">{playerError}</p>
-              <button onClick={() => { setPlayerError(null); setPlayerState('main_menu'); setSequenceIndex(0); setCurrentSceneId(storyData?.starting_scene || storyData?.scenes?.[0]?.id); }} className="w-full bg-[#3B0764] hover:bg-[#4C1D95] text-white font-bold py-4 rounded-xl transition text-[15px]">
+              <p className="text-[#8A7DAB] text-[14px] leading-relaxed mb-6">{playerError}</p>
+              <button onClick={() => { setPlayerError(null); setPlayerState('main_menu'); setSequenceIndex(0); setCurrentSceneId(storyData?.starting_scene || storyData?.scenes?.[0]?.id); }} className="w-full bg-[#3B0764] hover:bg-[#4C1D95] text-white font-bold py-3 rounded-xl transition text-[15px]">
                 Back to Main Menu
               </button>
             </div>
           </div>
         )}
 
+        {/* Landscape menus: title on the left, buttons on the right, so even
+            the five-button pause menu fits the ~457px-tall frame. */}
         {playerState === 'main_menu' && (
           <>
             <Backdrop blurred />
-            <div className="relative z-10 flex flex-col items-center justify-center w-full h-full px-8 pb-16 pt-8">
-              <div className="mt-auto mb-16 text-center">
-                 <h1 className="text-[32px] font-serif font-bold text-white mb-4 drop-shadow-xl leading-tight">{storyTitle}</h1>
+            <div className="relative z-10 flex items-center w-full h-full px-10 py-8 gap-8">
+              <div className="flex-1 min-w-0">
+                 <h1 className="text-[32px] font-serif font-bold text-white mb-4 drop-shadow-xl leading-tight break-words">{storyTitle}</h1>
                  <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase bg-[#1C1635]/60 px-4 py-1.5 rounded-full inline-block backdrop-blur-sm">YOUR STORY BEGINS NOW</p>
               </div>
-
-              <div className="space-y-4 w-full mt-auto">
-                <button onClick={() => { setSequenceIndex(0); setCurrentSceneId(storyData?.starting_scene || storyData?.scenes?.[0]?.id); setPlayerState('playing'); }} className="w-full bg-[#7C3AED] hover:bg-[#8B5CF6] text-white font-bold py-4 rounded-2xl shadow-[0_0_20px_rgba(124,58,237,0.4)] text-[16px] transition-all transform active:scale-95">Start New Game</button>
-                <button onClick={() => setPlayerState('load_menu')} className="w-full bg-[#2D1B4E]/80 backdrop-blur-md hover:bg-[#3B0764] text-white font-bold py-4 rounded-2xl text-[16px] transition border border-[#4D3A7A]/50">Load Game</button>
-                <button onClick={onClose} className="w-full bg-[#2D1B4E]/80 backdrop-blur-md hover:bg-[#3B0764] text-white font-bold py-4 rounded-2xl text-[16px] transition border border-[#4D3A7A]/50">Exit Test</button>
+              <div className="space-y-3 w-[260px] flex-shrink-0">
+                <button onClick={startNewGame} className={primaryBtn}>Start New Game</button>
+                <button onClick={() => setPlayerState('load_menu')} className={secondaryBtn}>Load Game</button>
+                <button onClick={onClose} className={secondaryBtn}>Exit Test</button>
               </div>
             </div>
           </>
@@ -2988,18 +3333,17 @@ function PlayTestEngine({
         {playerState === 'paused' && (
           <>
             <Backdrop blurred />
-            <div className="relative z-10 flex flex-col items-center justify-center w-full h-full px-8 pb-16 pt-8">
-              <div className="mb-auto mt-20 text-center">
+            <div className="relative z-10 flex items-center w-full h-full px-10 py-8 gap-8">
+              <div className="flex-1 min-w-0">
                  <h1 className="text-[32px] font-serif font-bold text-white mb-4 drop-shadow-xl leading-tight">Game Paused</h1>
-                 <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase bg-[#1C1635]/60 px-4 py-1.5 rounded-full inline-block backdrop-blur-sm">{storyTitle}</p>
+                 <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase bg-[#1C1635]/60 px-4 py-1.5 rounded-full inline-block backdrop-blur-sm max-w-full truncate">{storyTitle}</p>
               </div>
-
-              <div className="space-y-4 w-full mt-auto">
-                <button onClick={() => setPlayerState('playing')} className="w-full bg-[#7C3AED] hover:bg-[#8B5CF6] text-white font-bold py-4 rounded-2xl shadow-[0_0_20px_rgba(124,58,237,0.4)] text-[16px] transition-all transform active:scale-95">Resume</button>
-                <button onClick={() => { setSequenceIndex(0); setCurrentSceneId(storyData?.starting_scene || storyData?.scenes?.[0]?.id); setPlayerState('playing'); }} className="w-full bg-[#2D1B4E]/80 backdrop-blur-md hover:bg-[#3B0764] text-white font-bold py-4 rounded-2xl text-[16px] transition border border-[#4D3A7A]/50">Start New Game</button>
-                <button onClick={() => setPlayerState('save_menu')} className="w-full bg-[#2D1B4E]/80 backdrop-blur-md hover:bg-[#3B0764] text-white font-bold py-4 rounded-2xl text-[16px] transition border border-[#4D3A7A]/50">Save Game</button>
-                <button onClick={() => setPlayerState('load_menu')} className="w-full bg-[#2D1B4E]/80 backdrop-blur-md hover:bg-[#3B0764] text-white font-bold py-4 rounded-2xl text-[16px] transition border border-[#4D3A7A]/50">Load Game</button>
-                <button onClick={onClose} className="w-full bg-red-900/30 backdrop-blur-md hover:bg-red-900/50 text-red-200 font-bold py-4 rounded-2xl text-[16px] transition border border-red-500/30 mt-4">Exit Test</button>
+              <div className="space-y-2.5 w-[260px] flex-shrink-0">
+                <button onClick={() => setPlayerState('playing')} className={primaryBtn}>Resume</button>
+                <button onClick={startNewGame} className={secondaryBtn}>Start New Game</button>
+                <button onClick={() => setPlayerState('save_menu')} className={secondaryBtn}>Save Game</button>
+                <button onClick={() => setPlayerState('load_menu')} className={secondaryBtn}>Load Game</button>
+                <button onClick={onClose} className="w-full bg-red-900/30 backdrop-blur-md hover:bg-red-900/50 text-red-200 font-bold py-3 rounded-2xl text-[15px] transition border border-red-500/30">Exit Test</button>
               </div>
             </div>
           </>
@@ -3008,24 +3352,24 @@ function PlayTestEngine({
         {playerState === 'save_menu' && (
           <>
             <Backdrop blurred />
-            <div className="relative z-10 flex flex-col w-full h-full px-6 py-10 bg-[#0B0B14]/85 backdrop-blur-xl">
-              <div className="flex items-center justify-between mb-8">
-                <button onClick={() => setPlayerState('paused')} className="w-12 h-12 bg-[#1C1635] rounded-full flex items-center justify-center hover:bg-[#2D1B4E] transition border border-[#3B0764]">
-                  <ArrowLeft className="w-6 h-6 text-[#A78BFA]" />
+            <div className="relative z-10 flex flex-col w-full h-full px-8 pt-20 pb-6 bg-[#0B0B14]/85 backdrop-blur-xl">
+              <div className="flex items-center justify-between mb-4">
+                <button onClick={() => setPlayerState('paused')} className="w-10 h-10 bg-[#1C1635] rounded-full flex items-center justify-center hover:bg-[#2D1B4E] transition border border-[#3B0764]">
+                  <ArrowLeft className="w-5 h-5 text-[#A78BFA]" />
                 </button>
-                <h2 className="text-[22px] font-serif font-bold text-white tracking-wide pr-12 w-full text-center">Save Game</h2>
+                <h2 className="text-[20px] font-serif font-bold text-white tracking-wide pr-10 w-full text-center">Save Game</h2>
               </div>
 
-              <div className="flex-1 overflow-y-auto space-y-3 pb-6 no-scrollbar">
+              <div className="flex-1 overflow-y-auto grid grid-cols-2 gap-3 content-start pb-2 no-scrollbar">
                 {saveSlots.map((slot, idx) => (
-                  <button key={idx} onClick={() => handleSaveSlot(idx)} className="w-full bg-[#120F24] hover:bg-[#1C1635] border border-[#2D1B4E] hover:border-[#8B5CF6]/50 text-white text-left px-5 py-4 rounded-2xl flex items-center justify-between transition-all group">
-                    <div className="flex items-center gap-4">
-                      <div className="w-10 h-10 rounded-full bg-[#1C1635] group-hover:bg-[#3B0764] flex items-center justify-center transition-colors">
+                  <button key={idx} onClick={() => handleSaveSlot(idx)} className="w-full bg-[#120F24] hover:bg-[#1C1635] border border-[#2D1B4E] hover:border-[#8B5CF6]/50 text-white text-left px-4 py-3 rounded-2xl flex items-center justify-between gap-3 transition-all group">
+                    <div className="flex items-center gap-3">
+                      <div className="w-9 h-9 rounded-full bg-[#1C1635] group-hover:bg-[#3B0764] flex items-center justify-center transition-colors flex-shrink-0">
                          <Save className="w-4 h-4 text-[#A78BFA] group-hover:text-[#D8B4FE]" />
                       </div>
-                      <span className="font-bold text-[16px]">Slot {idx + 1}</span>
+                      <span className="font-bold text-[15px]">Slot {idx + 1}</span>
                     </div>
-                    <span className="text-[12px] text-[#8A7DAB] font-medium">{slot ? `Saved: ${slot.date}` : 'Empty Save Slot'}</span>
+                    <span className="text-[11px] text-[#8A7DAB] font-medium truncate">{slot ? `Saved: ${slot.date}` : 'Empty Save Slot'}</span>
                   </button>
                 ))}
               </div>
@@ -3036,24 +3380,24 @@ function PlayTestEngine({
         {playerState === 'load_menu' && (
           <>
             <Backdrop blurred />
-            <div className="relative z-10 flex flex-col w-full h-full px-6 py-10 bg-[#0B0B14]/85 backdrop-blur-xl">
-              <div className="flex items-center justify-between mb-8">
-                <button onClick={() => setPlayerState(storyData ? 'paused' : 'main_menu')} className="w-12 h-12 bg-[#1C1635] rounded-full flex items-center justify-center hover:bg-[#2D1B4E] transition border border-[#3B0764]">
-                  <ArrowLeft className="w-6 h-6 text-[#A78BFA]" />
+            <div className="relative z-10 flex flex-col w-full h-full px-8 pt-20 pb-6 bg-[#0B0B14]/85 backdrop-blur-xl">
+              <div className="flex items-center justify-between mb-4">
+                <button onClick={() => setPlayerState(storyData ? 'paused' : 'main_menu')} className="w-10 h-10 bg-[#1C1635] rounded-full flex items-center justify-center hover:bg-[#2D1B4E] transition border border-[#3B0764]">
+                  <ArrowLeft className="w-5 h-5 text-[#A78BFA]" />
                 </button>
-                <h2 className="text-[22px] font-serif font-bold text-white tracking-wide pr-12 w-full text-center">Load Game</h2>
+                <h2 className="text-[20px] font-serif font-bold text-white tracking-wide pr-10 w-full text-center">Load Game</h2>
               </div>
 
-              <div className="flex-1 overflow-y-auto space-y-3 pb-6 no-scrollbar">
+              <div className="flex-1 overflow-y-auto grid grid-cols-2 gap-3 content-start pb-2 no-scrollbar">
                 {saveSlots.map((slot, idx) => (
-                  <button key={idx} disabled={!slot} onClick={() => handleLoadSlot(idx)} className="w-full bg-[#120F24] hover:bg-[#1C1635] border border-[#2D1B4E] hover:border-[#8B5CF6]/50 text-white text-left px-5 py-4 rounded-2xl flex items-center justify-between transition-all group disabled:opacity-50 disabled:hover:border-[#2D1B4E] disabled:hover:bg-[#120F24]">
-                    <div className="flex items-center gap-4">
-                      <div className="w-10 h-10 rounded-full bg-[#1C1635] group-hover:bg-[#3B0764] flex items-center justify-center transition-colors">
+                  <button key={idx} disabled={!slot} onClick={() => handleLoadSlot(idx)} className="w-full bg-[#120F24] hover:bg-[#1C1635] border border-[#2D1B4E] hover:border-[#8B5CF6]/50 text-white text-left px-4 py-3 rounded-2xl flex items-center justify-between gap-3 transition-all group disabled:opacity-50 disabled:hover:border-[#2D1B4E] disabled:hover:bg-[#120F24]">
+                    <div className="flex items-center gap-3">
+                      <div className="w-9 h-9 rounded-full bg-[#1C1635] group-hover:bg-[#3B0764] flex items-center justify-center transition-colors flex-shrink-0">
                          <Download className={`w-4 h-4 ${slot ? 'text-[#A78BFA] group-hover:text-[#D8B4FE]' : 'text-[#4D3A7A]'}`} />
                       </div>
-                      <span className="font-bold text-[16px]">Slot {idx + 1}</span>
+                      <span className="font-bold text-[15px]">Slot {idx + 1}</span>
                     </div>
-                    <span className="text-[12px] text-[#8A7DAB] font-medium">{slot ? `Saved: ${slot.date}` : 'No Save Data'}</span>
+                    <span className="text-[11px] text-[#8A7DAB] font-medium truncate">{slot ? `Saved: ${slot.date}` : 'No Save Data'}</span>
                   </button>
                 ))}
               </div>
@@ -3064,27 +3408,32 @@ function PlayTestEngine({
         {playerState === 'story_end' && (
           <>
             <Backdrop blurred />
-            <div className="relative z-10 flex flex-col items-center justify-center w-full h-full px-8 pb-12 pt-8 text-center">
-              <div className="mb-8">
-                <CheckCircle2 className="w-16 h-16 text-[#34D399] mb-6 mx-auto" />
-                <h1 className="text-[36px] font-serif font-bold text-white mb-3 drop-shadow-xl">The End</h1>
-                <p className="text-[#C4B5FD] text-[15px] leading-relaxed max-w-xs mx-auto">
+            <div className="relative z-10 flex items-center w-full h-full px-10 py-8 gap-8">
+              <div className="flex-1 min-w-0">
+                <CheckCircle2 className="w-12 h-12 text-[#34D399] mb-4" />
+                <h1 className="text-[34px] font-serif font-bold text-white mb-2 drop-shadow-xl">The End</h1>
+                {currentScene.ending_id && (
+                  <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase mb-2">
+                    Ending: {declaredEndings.find(e => e.id === currentScene.ending_id)?.title || currentScene.ending_id}
+                  </p>
+                )}
+                <p className="text-[#C4B5FD] text-[14px] leading-relaxed max-w-sm">
                   You reached a story ending. The branch structure is validated and Publish is now unlocked.
                 </p>
               </div>
 
-              <div className="space-y-3 w-full mt-auto max-w-xs mx-auto">
-                <button onClick={() => { setSequenceIndex(0); setCurrentSceneId(storyData?.starting_scene || storyData?.scenes?.[0]?.id); setPlayerState('playing'); }} className="w-full bg-[#7C3AED] hover:bg-[#8B5CF6] text-white font-bold py-4 rounded-2xl shadow-[0_0_20px_rgba(124,58,237,0.4)] text-[16px] transition-all transform active:scale-95">
+              <div className="space-y-3 w-[260px] flex-shrink-0">
+                <button onClick={startNewGame} className={primaryBtn}>
                   Play Again
                 </button>
 
                 {onPublish && (
-                  <button onClick={() => { onPublish(); }} className="w-full bg-gradient-to-r from-[#10B981] to-[#059669] hover:from-[#34D399] hover:to-[#10B981] text-white font-bold py-4 rounded-2xl text-[16px] transition-all shadow-lg transform active:scale-95 flex items-center justify-center gap-2">
+                  <button onClick={() => { onPublish(); }} className="w-full bg-gradient-to-r from-[#10B981] to-[#059669] hover:from-[#34D399] hover:to-[#10B981] text-white font-bold py-3 rounded-2xl text-[15px] transition-all shadow-lg transform active:scale-95 flex items-center justify-center gap-2">
                     <CheckCircle2 className="w-5 h-5" /> Publish Story
                   </button>
                 )}
 
-                <button onClick={onClose} className="w-full bg-[#2D1B4E]/80 backdrop-blur-md hover:bg-[#3B0764] text-white font-bold py-4 rounded-2xl text-[16px] transition border border-[#4D3A7A]/50">
+                <button onClick={onClose} className={secondaryBtn}>
                   Back to Studio
                 </button>
               </div>
@@ -3096,55 +3445,168 @@ function PlayTestEngine({
           <div className="relative z-10 w-full h-full flex flex-col overflow-hidden">
             <Backdrop />
 
+            {/* Same framing as the player app, so the preview matches the game. */}
             {portraitUrl && (
               <img
                 src={portraitUrl}
                 alt={`${currentSequenceBlock.speaker || 'character'} (${currentSequenceBlock.expression || 'neutral'})`}
-                className="absolute bottom-0 right-4 h-[80%] max-h-[600px] object-contain drop-shadow-2xl z-30 pointer-events-none"
+                className="absolute bottom-0 right-4 h-[68%] max-w-[45%] object-contain object-bottom drop-shadow-2xl z-30 pointer-events-none"
               />
             )}
 
-            <div className="absolute top-6 left-6 z-50 cursor-pointer" onClick={() => setPlayerState('paused')}>
-               <div className="w-48 h-10 absolute inset-0 -ml-2 -mt-1 rounded-full"></div>
-            </div>
-
-            {(!isEndOfSequence || !(currentScene.choices && currentScene.choices.length > 0)) ? (
-              <div className="mt-auto relative z-40 px-4 pb-6 w-full flex justify-center cursor-pointer" onClick={advanceStory}>
-                <div className="relative w-full">
+            {!showingChoices ? (
+              <div className="mt-auto relative z-40 px-4 pb-5 w-full flex justify-center cursor-pointer" onClick={advanceStory}>
+                <div className="relative w-full max-w-3xl">
                   {currentSequenceBlock.speaker && (
                     <div className="absolute -top-4 left-6 bg-[#A855F7] text-white font-bold px-5 py-1.5 rounded-full shadow-lg z-50 text-[13px] tracking-wide border border-[#C084FC]/30">
                       {currentSequenceBlock.speaker}
                     </div>
                   )}
 
-                  <div className="bg-[#120F24]/95 backdrop-blur-xl border border-[#2D1B4E] w-full min-h-[140px] rounded-2xl p-6 pt-8 pb-8 text-white font-sans text-[16px] leading-relaxed shadow-[0_0_30px_rgba(0,0,0,0.8)] relative">
+                  <div className="bg-[#120F24]/95 backdrop-blur-xl border border-[#2D1B4E] w-full min-h-[110px] max-h-[40vh] overflow-y-auto no-scrollbar rounded-2xl p-5 pt-7 pb-7 text-white font-sans text-[15px] leading-relaxed shadow-[0_0_30px_rgba(0,0,0,0.8)] relative">
                     <span className={currentSequenceBlock.type === 'narrative' ? 'italic text-[#D8B4FE]' : 'text-gray-100'}>
                       {currentSequenceBlock.text || 'The silent dark city envelops you...'}
                     </span>
+                  </div>
 
-                    <div className="absolute -bottom-5 right-6 bg-white w-10 h-10 rounded-full flex items-center justify-center shadow-lg transition-transform hover:scale-105 border border-white/20">
-                      <ArrowRight className="w-5 h-5 text-[#4C1D95]" strokeWidth={3} />
-                    </div>
+                  <div className="absolute -bottom-4 right-6 bg-white w-9 h-9 rounded-full flex items-center justify-center shadow-lg transition-transform hover:scale-105 border border-white/20">
+                    <ArrowRight className="w-5 h-5 text-[#4C1D95]" strokeWidth={3} />
                   </div>
                 </div>
               </div>
             ) : (
-              <div className="mt-auto relative z-40 px-4 pb-8 w-full flex justify-center animate-fade-in-up">
-                <div className="w-full bg-[#120F24]/95 backdrop-blur-xl border border-[#2D1B4E] rounded-3xl p-6 shadow-[0_0_40px_rgba(0,0,0,0.9)]">
-                  <p className="text-white text-[15px] italic font-serif mb-6 leading-relaxed opacity-90 border-l-2 border-[#8B5CF6] pl-3">
+              <div className="mt-auto relative z-40 px-4 pb-5 w-full flex justify-center animate-fade-in-up">
+                <div className="w-full max-w-3xl bg-[#120F24]/95 backdrop-blur-xl border border-[#2D1B4E] rounded-3xl p-5 shadow-[0_0_40px_rgba(0,0,0,0.9)] max-h-[70vh] overflow-y-auto no-scrollbar">
+                  <p className="text-white text-[15px] italic font-serif mb-4 leading-relaxed opacity-90 border-l-2 border-[#8B5CF6] pl-3">
                     {currentScene.choice_prompt || "What do you think would be the best argument?"}
                   </p>
-                  <div className="flex flex-col gap-3">
-                    {currentScene.choices.map((choice, idx) => (
-                      <button
-                        key={idx}
-                        onClick={() => handleChoice(choice.next_scene)}
-                        className="bg-[#2D1B4E]/80 hover:bg-[#3B0764] border border-[#4D3A7A]/50 hover:border-[#8B5CF6] text-white font-bold py-4 px-6 rounded-2xl shadow-sm transition-all text-[15px] text-center leading-tight active:scale-[0.98]"
-                      >
-                        {choice.text}
-                      </button>
-                    ))}
+                  <div className="grid grid-cols-2 gap-3">
+                    {currentScene.choices.map((choice, idx) => {
+                      // Test build: locked options stay visible (greyed) so the
+                      // creator can see what they're gated on. The player app
+                      // hides them instead.
+                      const locked = !visibleChoices.includes(choice);
+                      return (
+                        <button
+                          key={idx}
+                          disabled={locked}
+                          onClick={() => handleChoice(choice)}
+                          className="bg-[#2D1B4E]/80 hover:bg-[#3B0764] border border-[#4D3A7A]/50 hover:border-[#8B5CF6] text-white font-bold py-3 px-4 rounded-2xl shadow-sm transition-all text-[14px] text-center leading-tight active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-[#2D1B4E]/80 disabled:hover:border-[#4D3A7A]/50 flex flex-col items-center gap-1.5"
+                        >
+                          <span>{choice.text}</span>
+                          {showEffects && (choice.condition || choice.effects) && (
+                            <span className="flex flex-wrap justify-center gap-1">
+                              {choice.condition && (
+                                <span className={`text-[10px] font-mono font-medium px-1.5 py-0.5 rounded flex items-center gap-1 border ${locked ? 'bg-red-900/30 text-red-200 border-red-500/30' : 'bg-[#1C1635] text-[#34D399] border-[#2D1B4E]'}`}>
+                                  <Lock className="w-2.5 h-2.5" /> {formatCondition(choice.condition)}
+                                </span>
+                              )}
+                              {formatEffects(choice.effects).map(label => (
+                                <span key={label} className="text-[10px] font-mono font-medium px-1.5 py-0.5 rounded bg-[#1C1635] text-[#C4B5FD] border border-[#2D1B4E]">{label}</span>
+                              ))}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
+                </div>
+              </div>
+            )}
+
+            {showStatePanel && (
+              <div className="absolute top-0 right-0 bottom-0 z-[65] w-[320px] max-w-[85%] bg-[#120F24]/95 backdrop-blur-xl border-l border-[#2D1B4E] flex flex-col">
+                <div className="flex items-center justify-between px-5 pt-5 pb-3 flex-shrink-0">
+                  <h3 className="text-white font-bold text-[15px] flex items-center gap-2"><SlidersHorizontal className="w-4 h-4 text-[#A78BFA]" /> Story State</h3>
+                  <button onClick={() => setShowStatePanel(false)} className="w-8 h-8 rounded-full bg-[#1C1635] border border-[#2D1B4E] flex items-center justify-center hover:bg-[#2D1B4E]">
+                    <X className="w-4 h-4 text-[#A78BFA]" />
+                  </button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto no-scrollbar px-5 pb-5 space-y-5">
+                  {!hasState ? (
+                    <p className="text-[#8A7DAB] text-[13px] leading-relaxed">
+                      This story has no state variables — it was generated before story state existed, so its choices and endings work the classic way.
+                    </p>
+                  ) : (
+                    <>
+                      <button onClick={() => setShowEffects(v => !v)} className="w-full bg-[#0B0B14] border border-[#2D1B4E] rounded-xl px-3 py-2 text-[12px] font-bold text-[#C4B5FD] flex items-center justify-center gap-2 hover:bg-[#1C1635]">
+                        {showEffects ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        {showEffects ? 'Hide effects on choices' : 'Show effects on choices'}
+                      </button>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase">Variables</p>
+                          <button onClick={() => setStoryState(buildInitialState(storyData))} className="text-[11px] text-[#8A7DAB] hover:text-[#C4B5FD] flex items-center gap-1">
+                            <RotateCcw className="w-3 h-3" /> Reset
+                          </button>
+                        </div>
+                        <div className="space-y-2">
+                          {stateVars.map(v => (
+                            <div key={v.id} className="bg-[#0B0B14] border border-[#2D1B4E] rounded-xl px-3 py-2 flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <p className="text-white text-[12px] font-bold truncate">{v.label || v.id}</p>
+                                <p className="text-[#8A7DAB] text-[10px] font-mono truncate">{v.id} · {v.kind}{v.character ? ` · ${v.character}` : ''}{v.due_day ? ` · due day ${v.due_day}` : ''}</p>
+                              </div>
+                              {STATE_BOOLEAN_KINDS.has(v.kind) ? (
+                                <button
+                                  onClick={() => setVarValue(v, !storyState[v.id])}
+                                  className={`text-[11px] font-bold px-3 py-1 rounded-lg border flex-shrink-0 ${storyState[v.id] ? 'bg-[#10B981]/20 text-[#34D399] border-[#10B981]/40' : 'bg-[#1C1635] text-[#8A7DAB] border-[#2D1B4E]'}`}
+                                >
+                                  {storyState[v.id] ? 'true' : 'false'}
+                                </button>
+                              ) : (
+                                <div className="flex items-center gap-1.5 flex-shrink-0">
+                                  <button onClick={() => setVarValue(v, (storyState[v.id] ?? 0) - 1)} className="w-6 h-6 rounded-md bg-[#1C1635] border border-[#2D1B4E] flex items-center justify-center hover:bg-[#2D1B4E]"><Minus className="w-3 h-3 text-[#C4B5FD]" /></button>
+                                  <span className="text-white text-[13px] font-mono w-8 text-center">{storyState[v.id]}</span>
+                                  <button onClick={() => setVarValue(v, (storyState[v.id] ?? 0) + 1)} className="w-6 h-6 rounded-md bg-[#1C1635] border border-[#2D1B4E] flex items-center justify-center hover:bg-[#2D1B4E]"><Plus className="w-3 h-3 text-[#C4B5FD]" /></button>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div>
+                        <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase mb-2">This scene</p>
+                        <div className="bg-[#0B0B14] border border-[#2D1B4E] rounded-xl p-3 space-y-1.5 text-[11px] font-mono">
+                          <p className="text-[#8A7DAB]">On arrival: <span className="text-[#C4B5FD]">{formatEffects(currentScene.effects).join(', ') || 'nothing'}</span></p>
+                          {currentScene.ending_gate && <p className="text-[#FBBF24]">Ending gate</p>}
+                          {currentScene.ending_id && <p className="text-[#FBBF24]">Ending: {currentScene.ending_id}</p>}
+                          {(currentScene.routes || []).map((r, i) => (
+                            <p key={i} className={evalCondition(storyState, r.condition) ? 'text-[#34D399]' : 'text-[#8A7DAB]'}>
+                              {evalCondition(storyState, r.condition) ? '✓' : '✗'} if {formatCondition(r.condition)} → {r.next_scene}
+                            </p>
+                          ))}
+                          {currentScene.routes?.length > 0 && (
+                            <p className="text-[#8A7DAB]">otherwise → {currentScene.next_scene_default || 'ending'}</p>
+                          )}
+                        </div>
+                        <button onClick={openEffectsEditor} className="mt-2 w-full bg-[#7C3AED] hover:bg-[#8B5CF6] text-white font-bold py-2 rounded-xl text-[12px] flex items-center justify-center gap-2">
+                          <Wand2 className="w-3.5 h-3.5" /> Edit effects for this scene
+                        </button>
+                      </div>
+
+                      {declaredEndings.length > 0 && (
+                        <div>
+                          <p className="text-[#A78BFA] font-bold text-[11px] tracking-widest uppercase mb-2">Endings (checked in order)</p>
+                          <div className="space-y-1.5">
+                            {declaredEndings.map(e => {
+                              const pass = evalCondition(storyState, e.condition);
+                              const isActive = activeEnding && activeEnding.id === e.id;
+                              return (
+                                <div key={e.id} className={`rounded-xl px-3 py-2 border text-[11px] ${isActive ? 'bg-[#10B981]/15 border-[#10B981]/40' : 'bg-[#0B0B14] border-[#2D1B4E]'}`}>
+                                  <p className={`font-bold ${isActive ? 'text-[#34D399]' : 'text-white'}`}>{isActive ? '→ ' : ''}{e.title || e.id}</p>
+                                  <p className={`font-mono ${pass ? 'text-[#34D399]' : 'text-[#8A7DAB]'}`}>{e.condition ? formatCondition(e.condition) : 'fallback'}</p>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
               </div>
             )}
