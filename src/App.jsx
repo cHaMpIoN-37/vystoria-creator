@@ -355,6 +355,9 @@ function CreatorApp({ session, onSignOut }) {
   const [artStyleTouched, setArtStyleTouched] = useState(false);
   const [generatingAssetKey, setGeneratingAssetKey] = useState(null);
   const [assetGenError, setAssetGenError] = useState(null);
+  // Shared by every asset tile (character portraits, backgrounds, cover) so
+  // there's one full-size viewer instead of three. null = closed.
+  const [lightboxImage, setLightboxImage] = useState(null);
 
   // --- Checkpoint / resume --------------------------------------------
   const [checkpointProgress, setCheckpointProgress] = useState(null);
@@ -1320,7 +1323,7 @@ function CreatorApp({ session, onSignOut }) {
   // Each row now offers Generate (AI) alongside Upload, using the same
   // description text the Copy button hands to an external tool.
   const AssetRow = ({ id, description, preview, onFile, onGenerate, isGenerating,
-                      canGenerate, onCopy, justCopied }) => {
+                      canGenerate, onCopy, justCopied, onView }) => {
     const [showModal, setShowModal] = useState(false);
     return (
       <>
@@ -1377,6 +1380,16 @@ function CreatorApp({ session, onSignOut }) {
                 <h3 className="text-white text-xl font-bold">{id}</h3>
                 <button onClick={() => setShowModal(false)} className="w-8 h-8 bg-[#1C1635] rounded-full flex items-center justify-center hover:bg-[#2D1B4E] transition-colors"><X className="text-[#8A7DAB] w-4 h-4" /></button>
               </div>
+              {preview && (
+                <button
+                  type="button"
+                  onClick={() => onView(preview, id)}
+                  title="View full size"
+                  className="w-full aspect-video bg-[#0B0B14] border border-[#1C1635] rounded-xl overflow-hidden mb-4 block hover:border-[#8B5CF6]/50 transition-colors"
+                >
+                  <img src={preview} alt={id} className="w-full h-full object-contain" />
+                </button>
+              )}
               <div className="bg-[#0B0B14] border border-[#1C1635] rounded-xl p-4 mb-6 max-h-56 overflow-y-auto">
                  <p className="text-[#C4B5FD] text-[15px] leading-relaxed select-all whitespace-pre-line">{description || 'No description generated.'}</p>
               </div>
@@ -1421,7 +1434,7 @@ function CreatorApp({ session, onSignOut }) {
   // right here on the Asset Art key.
   const CharacterAssetCard = ({
     character, uploadedByExpr, onUpload, onCopyPrompt, copiedKey,
-    onGenerate, generatingKey, canGenerate,
+    onGenerate, generatingKey, canGenerate, onView,
   }) => {
     const expressions = character.expressions?.length
       ? character.expressions
@@ -1506,6 +1519,16 @@ function CreatorApp({ session, onSignOut }) {
                   >
                     {justCopied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
                   </button>
+                  {preview && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); onView(preview, `${character.name} — ${expr.id}`); }}
+                      title="View full size"
+                      className="w-5 h-5 rounded-full flex items-center justify-center bg-black/70 text-[#C4B5FD] hover:bg-[#8B5CF6] hover:text-white transition-colors"
+                    >
+                      <Eye className="w-3 h-3" />
+                    </button>
+                  )}
                 </div>
               </div>
             );
@@ -1666,8 +1689,6 @@ function CreatorApp({ session, onSignOut }) {
               label="Engine Config"
               description={`${provider}${modelName.trim() ? ' · ' + modelName.trim().split('-')[0] : ' · auto-selected model'} · judge: ${judgeMode}`}
               onClick={() => setCurrentView('engine_config')}
-              disabled={configLocked}
-              disabledLabel="Locked after start"
             />
             <NavPill
               icon={BookOpen}
@@ -1745,6 +1766,18 @@ function CreatorApp({ session, onSignOut }) {
       <div className="flex flex-col h-full bg-[#0B0B14]">
         <div className="flex-1 overflow-y-auto px-6 pt-12 pb-6 max-w-md mx-auto w-full">
           <ScreenHeader title="Engine Config" subtitleText="Paste any provider's API key — the engine works with whatever model that key currently has access to." />
+
+          {configLocked && (
+            <div className="bg-[#120F24] border border-[#2D1B4E] rounded-2xl p-4 mb-2 text-[#8A7DAB] text-[12px] leading-relaxed flex items-start gap-3">
+              <AlertTriangle className="w-4 h-4 text-[#A78BFA] flex-shrink-0 mt-0.5" />
+              <span className="flex-1">
+                This draft already {taskStatus === 'completed' ? 'finished generating' : 'started generating'}, so
+                changes below the <span className="text-[#C4B5FD] font-bold">Asset Art</span> section won't rewrite
+                it — they'd only apply if you later press Resume. Asset Art itself is always live: change the image
+                key any time to switch providers for art generation.
+              </span>
+            </div>
+          )}
 
           <div className="space-y-6 mt-8">
             <div>
@@ -2370,6 +2403,7 @@ function CreatorApp({ session, onSignOut }) {
                     )}
                     generatingKey={generatingAssetKey}
                     canGenerate={!!imageApiKey}
+                    onView={(url, label) => setLightboxImage({ url, label })}
                   />
                 ))}
               </div>
@@ -2392,6 +2426,7 @@ function CreatorApp({ session, onSignOut }) {
                     canGenerate={!!imageApiKey}
                     onCopy={() => handleCopyAssetPrompt('backgrounds', b.id, b.description)}
                     justCopied={copiedExpr === `backgrounds__${b.id}`}
+                    onView={(url, label) => setLightboxImage({ url, label })}
                   />
                 ))}
               </div>
@@ -2412,6 +2447,7 @@ function CreatorApp({ session, onSignOut }) {
                   canGenerate={!!imageApiKey}
                   onCopy={() => handleCopyAssetPrompt('cover', 'cover', coverDescription)}
                   justCopied={copiedExpr === 'cover__cover'}
+                  onView={(url, label) => setLightboxImage({ url, label })}
                 />
               </div>
             </div>
@@ -2437,6 +2473,8 @@ function CreatorApp({ session, onSignOut }) {
           </button>
         </div>
       )}
+
+      <ImageLightbox image={lightboxImage} onClose={() => setLightboxImage(null)} />
         </div>
     );
   };
