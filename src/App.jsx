@@ -1548,6 +1548,27 @@ function CreatorApp({ session, onSignOut }) {
       </svg>
   );
 
+  // One full-size viewer shared by every asset tile. `image` is
+  // {url, label} | null — null renders nothing, so this can sit mounted
+  // at all times rather than being conditionally included in the tree.
+  const ImageLightbox = ({ image, onClose }) => {
+    if (!image) return null;
+    return (
+      <div className="fixed inset-0 z-[1000] bg-black/90 backdrop-blur-sm flex items-center justify-center p-6" onClick={onClose}>
+        <div className="relative max-w-4xl w-full max-h-[90vh] flex flex-col items-center" onClick={e => e.stopPropagation()}>
+          <button
+            onClick={onClose}
+            className="absolute -top-12 right-0 w-10 h-10 bg-[#1C1635] border border-[#2D1B4E] rounded-full flex items-center justify-center hover:bg-[#2D1B4E] transition-colors"
+          >
+            <X className="text-white w-5 h-5" />
+          </button>
+          <img src={image.url} alt={image.label} className="max-w-full max-h-[80vh] object-contain rounded-xl shadow-2xl" />
+          {image.label && <p className="text-[#C4B5FD] text-[13px] font-bold mt-4 tracking-wide">{image.label}</p>}
+        </div>
+      </div>
+    );
+  };
+
   const STATUS_META = {
     idle:       { label: 'Idle', dot: 'bg-[#4D3A7A]', text: 'text-[#8A7DAB]' },
     pending:    { label: 'Starting', dot: 'bg-[#8B5CF6] animate-pulse', text: 'text-[#C4B5FD]' },
