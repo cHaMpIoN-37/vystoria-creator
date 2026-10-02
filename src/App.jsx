@@ -81,6 +81,7 @@ const PROVIDER_LABELS = {
   openai: 'OpenAI',
   claude: 'Anthropic Claude',
   grok: 'xAI Grok',
+  openrouter: 'OpenRouter',
 };
 
 const MODEL_PLACEHOLDERS = {
@@ -88,6 +89,9 @@ const MODEL_PLACEHOLDERS = {
   openai: 'Leave blank for the recommended default, or paste e.g. gpt-4o',
   claude: 'Leave blank for the recommended default, or paste e.g. claude-sonnet-4-6',
   grok: 'Leave blank for the recommended default, or paste e.g. grok-2-latest',
+  // Blank = openrouter/free, which may switch models between chapters.
+  // Pinning one ":free" model keeps the whole book in one voice.
+  openrouter: 'Blank = any free model, or pin one e.g. nvidia/nemotron-3-ultra-550b-a55b:free',
 };
 
 // Asset art runs on its own provider + key so portrait generation can't eat
@@ -95,11 +99,13 @@ const MODEL_PLACEHOLDERS = {
 const IMAGE_PROVIDER_LABELS = {
   gemini: 'Google Gemini (images)',
   openai: 'OpenAI (images)',
+  cloudflare: 'Cloudflare Workers AI (free)',
 };
 
 const IMAGE_MODEL_PLACEHOLDERS = {
   gemini: 'Leave blank for gemini-2.5-flash-image',
   openai: 'Leave blank for gpt-image-1',
+  cloudflare: 'Leave blank for @cf/black-forest-labs/flux-1-schnell',
 };
 
 //// ---------------------------------------------------------------------------
@@ -221,6 +227,9 @@ const PROVIDER_DAILY_HINT = {
   openai: null,
   claude: null,
   grok: null,
+  // ":free" models: 50 requests/day with no credits bought, 1,000/day once
+  // the account has ever bought $10+ of credits.
+  openrouter: 50,
 };
 
 const JUDGE_MODES = [
@@ -1745,6 +1754,7 @@ function CreatorApp({ session, onSignOut }) {
                 <option value="openai">OpenAI (ChatGPT)</option>
                 <option value="claude">Anthropic Claude</option>
                 <option value="grok">xAI Grok</option>
+                <option value="openrouter">OpenRouter (free models)</option>
               </select>
             </div>
 
@@ -1845,6 +1855,7 @@ function CreatorApp({ session, onSignOut }) {
                   <select value={imageProvider} onChange={(e) => { setImageProvider(e.target.value); setImageModel(''); }} className={fieldClasses}>
                     <option value="gemini">Google Gemini (images)</option>
                     <option value="openai">OpenAI (images)</option>
+                    <option value="cloudflare">Cloudflare Workers AI (free — backgrounds &amp; cover)</option>
                   </select>
                 </div>
 
@@ -1867,9 +1878,19 @@ function CreatorApp({ session, onSignOut }) {
                     type="password"
                     value={imageApiKey}
                     onChange={(e) => setImageApiKey(e.target.value)}
-                    placeholder={`Enter ${IMAGE_PROVIDER_LABELS[imageProvider] || 'image'} key`}
+                    placeholder={imageProvider === 'cloudflare'
+                      ? 'ACCOUNT_ID:API_TOKEN'
+                      : `Enter ${IMAGE_PROVIDER_LABELS[imageProvider] || 'image'} key`}
                     className={fieldClasses}
                   />
+                  {imageProvider === 'cloudflare' && (
+                    <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">
+                      Paste your Account ID and an API token joined by a colon. Both are on the Cloudflare
+                      dashboard's Workers AI page (create the token with the "Workers AI" template). Free up to
+                      Cloudflare's daily allowance. It makes square images without transparency, so it's for
+                      backgrounds and the cover only — portraits will be refused with an explanation.
+                    </p>
+                  )}
                 </div>
 
                 <div>
