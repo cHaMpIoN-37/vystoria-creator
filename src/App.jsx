@@ -99,12 +99,14 @@ const MODEL_PLACEHOLDERS = {
 const IMAGE_PROVIDER_LABELS = {
   gemini: 'Google Gemini (images)',
   openai: 'OpenAI (images)',
+  openrouter: 'OpenRouter (images)',
   cloudflare: 'Cloudflare Workers AI (free)',
 };
 
 const IMAGE_MODEL_PLACEHOLDERS = {
   gemini: 'Leave blank for gemini-2.5-flash-image',
   openai: 'Leave blank for gpt-image-1',
+  openrouter: 'Leave blank for google/gemini-2.5-flash-image',
   cloudflare: 'Leave blank for @cf/black-forest-labs/flux-1-schnell',
 };
 
@@ -1909,6 +1911,7 @@ function CreatorApp({ session, onSignOut }) {
                   <select value={imageProvider} onChange={(e) => { setImageProvider(e.target.value); setImageModel(''); }} className={fieldClasses}>
                     <option value="gemini">Google Gemini (images)</option>
                     <option value="openai">OpenAI (images)</option>
+                    <option value="openrouter">OpenRouter (images)</option>
                     <option value="cloudflare">Cloudflare Workers AI (free — backgrounds &amp; cover)</option>
                   </select>
                 </div>
@@ -1943,6 +1946,14 @@ function CreatorApp({ session, onSignOut }) {
                       dashboard's Workers AI page (create the token with the "Workers AI" template). Free up to
                       Cloudflare's daily allowance. It makes square images without transparency, so it's for
                       backgrounds and the cover only — portraits will be refused with an explanation.
+                    </p>
+                  )}
+                  {imageProvider === 'openrouter' && (
+                    <p className="text-xs text-[#8A7DAB] mt-3 leading-relaxed pl-1">
+                      Use your OpenRouter key. Type any model that lists "image" under output modalities on
+                      openrouter.ai/models (filter by output: image). Models ending in ":free" cost nothing but
+                      have a small daily request cap. Most models return an opaque background, so check one
+                      portrait before generating the whole cast.
                     </p>
                   )}
                 </div>
